@@ -93,13 +93,15 @@ Express the create-time safety boundary with `policy`. Sandbox-scoped `setPolicy
 cannot introduce static policy fields later, so set filesystem, landlock,
 process, and initial network policy at creation. For proto spec fields the
 curated shape does not surface, `rawSpec` is an escape hatch that shallow-
-overrides the assembled spec at the top level (any field it sets wins):
+overrides the assembled spec at the top level (any field it sets wins). Each
+top-level field it sets replaces the curated value as a whole message, so a
+`rawSpec.template` discards the template built from `image`; set the image
+inside it instead:
 
 ```ts
 await client.sandbox.create({
-  image,
   policy: { version: 1, networkPolicies: {} },
-  rawSpec: { logLevel: 'debug', template: { runtimeClassName: 'gvisor' } },
+  rawSpec: { logLevel: 'debug', template: { image, runtimeClassName: 'gvisor' } },
 })
 ```
 
@@ -174,7 +176,7 @@ const ssh = await client.sandbox.createSshSession(name)
 await client.sandbox.revokeSshSession(ssh.token)
 
 await client.sandbox.attachProvider(name, 'claude')
-await client.sandbox.listProviders(name)
+await client.sandbox.listAllProviders(name)
 await client.sandbox.detachProvider(name, 'claude')
 
 const config = await client.sandbox.getConfig(name)
