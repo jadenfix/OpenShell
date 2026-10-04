@@ -828,22 +828,17 @@ fn lsof_listeners(port: u16) -> Option<String> {
 
 /// Resolve the SSH gateway host and port for a sandbox connection.
 ///
-/// If the server-provided gateway host is a loopback address, use the host
-/// and port from the cluster endpoint instead so the client connects to the
-/// right machine. The server returns its internal bind address (e.g. 0.0.0.0:8080)
-/// which may not be reachable from outside — the cluster URL has the actual
-/// Docker-mapped or tunnel port.
+/// If the server-provided gateway host is a loopback or unspecified address,
+/// use the host and port from the cluster endpoint instead so the client
+/// connects to the right machine. The server returns its internal bind address
+/// (e.g. `0.0.0.0:8080` or `[::]:8080`) which may not be reachable from outside
+/// — the cluster URL has the actual Docker-mapped or tunnel port.
 pub fn resolve_ssh_gateway(
     gateway_host: &str,
     gateway_port: u16,
     cluster_url: &str,
 ) -> (String, u16) {
-    let is_loopback = gateway_host == "127.0.0.1"
-        || gateway_host == "0.0.0.0"
-        || gateway_host == "localhost"
-        || gateway_host == "::1";
-
-    if !is_loopback {
+    if !is_local_host(gateway_host) {
         return (gateway_host.to_string(), gateway_port);
     }
 
@@ -853,9 +848,7 @@ pub fn resolve_ssh_gateway(
         && let Some(host) = url.host_str()
     {
         let cluster_port = url.port_or_known_default().unwrap_or(gateway_port);
-        let cluster_is_loopback =
-            host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
-        if !cluster_is_loopback {
+        if !is_local_host(host) {
             // Remote cluster: use the remote host but keep the cluster URL port.
             return (host.to_string(), cluster_port);
         }
@@ -863,13 +856,30 @@ pub fn resolve_ssh_gateway(
         // literal as a TLS DNS name. In those cases, keep the cluster URL's
         // already-reachable authority. Other loopback addresses retain the
         // gateway-reported host.
-        if matches!(gateway_host, "0.0.0.0" | "::" | "::1") {
+        if parse_ip_host(gateway_host).is_some_and(|ip| ip.is_unspecified() || ip.is_ipv6()) {
             return (host.to_string(), cluster_port);
         }
         return (gateway_host.to_string(), cluster_port);
     }
 
     (gateway_host.to_string(), gateway_port)
+}
+
+/// Parse an IP literal host, accepting the bracketed IPv6 form (`[::1]`) used
+/// in URL authorities.
+fn parse_ip_host(host: &str) -> Option<std::net::IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+/// Whether `host` names this machine: `localhost`, a loopback address, or an
+/// unspecified (bind-any) address such as `0.0.0.0` or `::`.
+fn is_local_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || parse_ip_host(host).is_some_and(|ip| ip.is_loopback() || ip.is_unspecified())
 }
 
 /// Bracket a bare IPv6 literal (e.g. `::1` → `[::1]`) so it can be embedded in
@@ -1161,6 +1171,27 @@ mod tests {
         let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://127.0.0.1:9000");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 9000);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_overrides_ipv6_unspecified_with_cluster_host() {
+        let (host, port) = resolve_ssh_gateway("::", 8080, "https://remote:443");
+        assert_eq!(host, "remote");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_swaps_ipv6_unspecified_for_loopback_cluster_host() {
+        let (host, port) = resolve_ssh_gateway("::", 8080, "https://localhost:8443");
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 8443);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_treats_bracketed_ipv6_cluster_loopback_as_local() {
+        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://[::1]:8443");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8443);
     }
 
     #[test]
