@@ -416,7 +416,9 @@ fn parse_remove_endpoint_spec(spec: &str) -> Result<(String, u32)> {
 }
 
 fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
-    let parts = spec.split(':').collect::<Vec<_>>();
+    // The options segment is last and may itself contain ':' (for example an
+    // IPv6 `allowed-ip=fd00::/8`), so stop splitting once it is reached.
+    let parts = spec.splitn(6, ':').collect::<Vec<_>>();
     if !(2..=6).contains(&parts.len()) {
         return Err(miette!(
             "--add-endpoint expects host:port[:access[:protocol[:enforcement[:options]]]], got '{spec}'"
@@ -894,6 +896,31 @@ mod tests {
             panic!("expected add-rule preview");
         };
         assert_eq!(rule.endpoints[0].allowed_ips, vec!["192.168.0.0/16"]);
+    }
+
+    #[test]
+    fn parse_add_endpoint_accepts_ipv6_allowed_ip() {
+        let plan = build_policy_update_plan(
+            &[
+                "api.example.com:443:read-only:rest:enforce:allowed-ip=fd00::/8,allowed-ip=2001:db8::1"
+                    .to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert_eq!(
+            rule.endpoints[0].allowed_ips,
+            vec!["fd00::/8".to_string(), "2001:db8::1".to_string()]
+        );
     }
 
     #[test]
