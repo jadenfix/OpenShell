@@ -679,7 +679,13 @@ linux_package_method() {
       ;;
   esac
 
-  if has_cmd dpkg; then
+  # Prefer the format of the native package frontend: hosts can carry both
+  # dpkg and rpm, but only one of them manages the system.
+  if has_cmd dpkg && { has_cmd apt-get || has_cmd apt; }; then
+    echo "deb"
+  elif has_cmd rpm && { has_cmd dnf || has_cmd yum || has_cmd zypper; }; then
+    echo "rpm"
+  elif has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
     echo "rpm"

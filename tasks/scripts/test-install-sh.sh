@@ -102,6 +102,7 @@ assert_glibc_preflight_fails \
 
 # snap_state: 0 = no snap command, 1 = snap command only,
 # installed = the OpenShell snap is already installed.
+# extra_cmds: optional space-separated package frontends that are present.
 assert_linux_package_method() {
   local name=$1
   local install_method=$2
@@ -110,6 +111,7 @@ assert_linux_package_method() {
   local dpkg_present=$5
   local rpm_present=$6
   local expected=$7
+  local extra_cmds=${8:-}
   local actual
 
   (
@@ -120,7 +122,7 @@ assert_linux_package_method() {
         snap) [ "$snap_state" != "0" ] ;;
         dpkg) [ "$dpkg_present" = "1" ] ;;
         rpm) [ "$rpm_present" = "1" ] ;;
-        *) return 1 ;;
+        *) case " ${extra_cmds} " in *" $1 "*) return 0 ;; *) return 1 ;; esac ;;
       esac
     }
     snap() { [ "$*" = "list openshell" ] && [ "$snap_state" = "installed" ]; }
@@ -147,6 +149,13 @@ assert_linux_package_method "numbered prerelease uses deb despite existing snap"
 assert_linux_package_method "pinned stable uses rpm despite existing snap" "" v1.2.3 installed 0 1 rpm
 assert_linux_package_method "deb is selected without snap" "" "" 0 1 1 deb
 assert_linux_package_method "rpm is selected without snap or deb" "" "" 0 0 1 rpm
+assert_linux_package_method "dnf host with dpkg installed uses rpm" "" "" 0 1 1 rpm dnf
+assert_linux_package_method "yum host with dpkg installed uses rpm" "" "" 0 1 1 rpm yum
+assert_linux_package_method "zypper host with dpkg installed uses rpm" "" "" 0 1 1 rpm zypper
+assert_linux_package_method "apt-get host with rpm installed uses deb" "" "" 0 1 1 deb apt-get
+assert_linux_package_method "apt host with rpm installed uses deb" "" "" 0 1 1 deb apt
+assert_linux_package_method "dnf without rpm falls back to dpkg" "" "" 0 1 0 deb dnf
+assert_linux_package_method "explicit deb on a dnf host" deb "" 0 1 1 deb dnf
 
 if (OPENSHELL_INSTALL_METHOD=flatpak linux_package_method) >"$out" 2>"$err"; then
   echo "FAIL: unsupported OPENSHELL_INSTALL_METHOD should be rejected" >&2
