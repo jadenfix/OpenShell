@@ -68,7 +68,7 @@ use super::provider::{
 };
 use super::validation::{
     level_matches, source_matches, validate_and_canonicalize_policy, validate_dns1123_label,
-    validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
+    validate_exec_request_fields, validate_min_level, validate_no_reserved_provider_policy_keys,
     validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
 };
 use super::{MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN};
@@ -1871,6 +1871,7 @@ pub(super) async fn handle_watch_sandbox(
     }
     let log_since_time = req.since_time;
     let log_sources = req.log_sources;
+    validate_min_level(&req.log_min_level, "log_min_level")?;
     let log_min_level = req.log_min_level;
     let event_tail = req.event_tail;
 
@@ -4648,6 +4649,28 @@ mod tests {
         WatchCursor::parse(&evt.cursor)
             .expect("resumable event must carry a valid cursor")
             .seq
+    }
+
+    #[tokio::test]
+    async fn watch_rejects_unknown_log_min_level() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("leveled", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = handle_watch_sandbox(
+            &state,
+            authed_request(WatchSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                follow_logs: true,
+                log_min_level: "WARNING".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("unknown log level must be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

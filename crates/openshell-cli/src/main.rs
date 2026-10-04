@@ -552,9 +552,10 @@ enum Commands {
         #[arg(long, default_value = "all")]
         source: Vec<String>,
 
-        /// Minimum log level to display: error, warn, info (default), debug, trace.
-        #[arg(long, default_value = "")]
-        level: String,
+        /// Minimum log level to display: error, warn, info, debug, or trace.
+        /// Shows all levels when omitted.
+        #[arg(long, value_parser = ["error", "warn", "info", "debug", "trace"], ignore_case = true)]
+        level: Option<String>,
     },
 
     /// Manage sandbox policy.
@@ -3012,7 +3013,7 @@ async fn run_async() -> Result<()> {
                 tail,
                 since.as_deref(),
                 &source,
-                &level,
+                level.as_deref().unwrap_or(""),
                 &cli.workspace,
                 &tls,
             )
@@ -4792,6 +4793,32 @@ mod tests {
     #[test]
     fn managed_inference_is_not_a_command() {
         assert!(Cli::try_parse_from(["openshell", "inference", "get"]).is_err());
+    }
+
+    #[test]
+    fn logs_level_accepts_known_levels_case_insensitively() {
+        let cli = Cli::try_parse_from(["openshell", "logs", "sandbox-1", "--level", "WARN"])
+            .expect("known level should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logs { level: Some(ref level), .. }) if level.eq_ignore_ascii_case("warn")
+        ));
+
+        let cli = Cli::try_parse_from(["openshell", "logs", "sandbox-1"])
+            .expect("level should be optional");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logs { level: None, .. })
+        ));
+    }
+
+    #[test]
+    fn logs_level_rejects_unknown_levels() {
+        for level in ["warning", "verbose"] {
+            let err = Cli::try_parse_from(["openshell", "logs", "sandbox-1", "--level", level])
+                .expect_err("unknown level should be rejected");
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{level}");
+        }
     }
 
     #[test]

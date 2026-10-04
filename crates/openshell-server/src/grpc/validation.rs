@@ -1113,21 +1113,40 @@ pub(super) fn source_matches(log_source: &str, filters: &[String]) -> bool {
     filters.iter().any(|f| f == effective)
 }
 
-/// Check if a log line's level meets the minimum level threshold.
-/// Empty `min_level` means no filtering (all levels pass).
-pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
-    if min_level.is_empty() {
-        return true;
+/// Severity rank of a log level, case-insensitive. Lower is more severe.
+/// OCSF events are emitted at INFO. Returns `None` for unknown levels.
+fn log_level_rank(level: &str) -> Option<u8> {
+    match level.to_uppercase().as_str() {
+        "ERROR" => Some(0),
+        "WARN" => Some(1),
+        "INFO" | "OCSF" => Some(2),
+        "DEBUG" => Some(3),
+        "TRACE" => Some(4),
+        _ => None,
     }
-    let to_num = |s: &str| match s.to_uppercase().as_str() {
-        "ERROR" => 0,
-        "WARN" => 1,
-        "INFO" | "OCSF" => 2,
-        "DEBUG" => 3,
-        "TRACE" => 4,
-        _ => 5, // unknown levels always pass
+}
+
+/// Validate a requested minimum log level.
+/// Empty means no filtering; anything else must be a known level.
+pub(super) fn validate_min_level(min_level: &str, field: &str) -> Result<(), Status> {
+    if min_level.is_empty() || log_level_rank(min_level).is_some() {
+        return Ok(());
+    }
+    Err(invalid_argument(
+        field,
+        format!("unknown log level '{min_level}'; expected one of ERROR, WARN, INFO, DEBUG, TRACE"),
+    ))
+}
+
+/// Check if a log line's level meets the minimum level threshold.
+/// Empty `min_level` means no filtering (all levels pass). Callers must reject
+/// unknown `min_level` values with [`validate_min_level`] first. While a filter
+/// is active, lines with an unknown level are excluded.
+pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
+    let Some(min_rank) = log_level_rank(min_level) else {
+        return true;
     };
-    to_num(log_level) <= to_num(min_level)
+    log_level_rank(log_level).is_some_and(|rank| rank <= min_rank)
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,6 +1216,35 @@ mod tests {
     fn level_matches_treats_ocsf_as_info() {
         assert!(level_matches("OCSF", "INFO"));
         assert!(!level_matches("OCSF", "WARN"));
+    }
+
+    #[test]
+    fn level_matches_filters_by_threshold() {
+        assert!(level_matches("ERROR", "WARN"));
+        assert!(level_matches("warn", "WARN"));
+        assert!(!level_matches("INFO", "WARN"));
+        assert!(!level_matches("DEBUG", "WARN"));
+        assert!(!level_matches("TRACE", "warn"));
+        assert!(!level_matches("CUSTOM", "TRACE"));
+        assert!(level_matches("TRACE", ""));
+    }
+
+    #[test]
+    fn validate_min_level_accepts_known_levels() {
+        for level in ["", "ERROR", "warn", "Info", "DEBUG", "trace", "OCSF"] {
+            assert!(
+                validate_min_level(level, "min_level").is_ok(),
+                "{level:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_min_level_rejects_unknown_levels() {
+        for level in ["WARNING", "verbose", "1"] {
+            let err = validate_min_level(level, "min_level").unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument, "{level:?}");
+        }
     }
 
     #[test]

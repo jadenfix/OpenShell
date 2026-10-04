@@ -97,7 +97,7 @@ use tracing::{debug, info, warn};
 
 use super::validation::{
     level_matches, source_matches, validate_and_canonicalize_policy, validate_annotations,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    validate_min_level, validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_static_fields_unchanged,
 };
 use super::{StoredSettingValue, StoredSettings};
@@ -4863,6 +4863,7 @@ pub(super) async fn handle_get_sandbox_logs(
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
     }
     let since_time = req.since_time;
+    validate_min_level(&req.min_level, "min_level")?;
 
     let logs: Vec<SandboxLogLine> = tail
         .into_iter()
@@ -9941,6 +9942,43 @@ mod tests {
                     seconds: 253_402_300_800,
                     nanos: 0,
                 }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_logs_rejects_unknown_min_level() {
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-id".to_string(),
+                name: "sandbox".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        state.tracing_log_bus.publish_external(SandboxLogLine {
+            sandbox_id: "sandbox-id".to_string(),
+            level: "DEBUG".to_string(),
+            message: "debug line".to_string(),
+            ..Default::default()
+        });
+
+        let error = handle_get_sandbox_logs(
+            &state,
+            with_user(Request::new(GetSandboxLogsRequest {
+                sandbox: "sandbox".to_string(),
+                min_level: "WARNING".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
                 )),
