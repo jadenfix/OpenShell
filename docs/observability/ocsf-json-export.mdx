@@ -60,7 +60,7 @@ etw_audit = true
 $env:OPENSHELL_OCSF_JSON = "1"
 # Optional; defaults to %PROGRAMDATA%\OpenShell\logs.
 $env:OPENSHELL_OCSF_LOG_DIR = "D:\OpenShell\audit"
-openshell-gateway --drivers mxc --config gateway.toml
+openshell-gateway --compute-driver mxc --config gateway.toml
 ```
 
 The sink is available only when Windows selects the MXC driver. It rotates
