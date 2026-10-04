@@ -1458,11 +1458,20 @@ class WorkspaceRef:
     labels: dict[str, str]
 
 
+def _workspace_phase_name(phase: int) -> str:
+    # Newer gateways may report phases this client does not know; keep the
+    # raw value visible instead of failing the whole response.
+    try:
+        return datamodel_pb2.WorkspacePhase.Name(phase)
+    except ValueError:
+        return f"WORKSPACE_PHASE_UNKNOWN_{phase}"
+
+
 def _workspace_ref(ws: datamodel_pb2.Workspace) -> WorkspaceRef:
     meta = ws.metadata
     return WorkspaceRef(
         name=meta.name,
-        phase=datamodel_pb2.WorkspacePhase.Name(ws.status.phase),
+        phase=_workspace_phase_name(ws.status.phase),
         labels=dict(meta.labels),
     )
 

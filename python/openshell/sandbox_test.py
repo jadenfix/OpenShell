@@ -17,7 +17,7 @@ from typing import Any, cast
 import pytest
 
 import openshell.sandbox as sandbox_module
-from openshell._proto import openshell_pb2
+from openshell._proto import datamodel_pb2, openshell_pb2
 from openshell.mutations import DeletionOutcome
 from openshell.sandbox import (
     _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
@@ -35,6 +35,7 @@ from openshell.sandbox import (
     ServiceAuthorizationMode,
     ServiceExposure,
     TlsConfig,
+    WorkspaceRef,
     _atomic_replace,
     _BearerAuthInterceptor,
     _load_cluster_bearer_token,
@@ -44,6 +45,7 @@ from openshell.sandbox import (
     _read_oidc_token_bundle,
     _sandbox_ref,
     _validate_oauth_url,
+    _workspace_ref,
 )
 
 
@@ -2994,6 +2996,26 @@ def test_sandbox_ref_includes_workspace_from_proto() -> None:
     ref = _sandbox_ref(proto)
 
     assert ref.workspace == "production"
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        (datamodel_pb2.WORKSPACE_PHASE_ACTIVE, "WORKSPACE_PHASE_ACTIVE"),
+        (datamodel_pb2.WORKSPACE_PHASE_TERMINATING, "WORKSPACE_PHASE_TERMINATING"),
+        # A phase added by a newer gateway must not break older clients.
+        (99, "WORKSPACE_PHASE_UNKNOWN_99"),
+    ],
+)
+def test_workspace_ref_maps_phase_names(phase: int, expected: str) -> None:
+    wire = datamodel_pb2.Workspace(
+        metadata=datamodel_pb2.ObjectMeta(name="team-a", labels={"env": "dev"}),
+        status=datamodel_pb2.WorkspaceStatus(phase=cast("Any", phase)),
+    ).SerializeToString()
+
+    ref = _workspace_ref(datamodel_pb2.Workspace.FromString(wire))
+
+    assert ref == WorkspaceRef(name="team-a", phase=expected, labels={"env": "dev"})
 
 
 def test_sandbox_ref_includes_workload_template_provenance() -> None:
