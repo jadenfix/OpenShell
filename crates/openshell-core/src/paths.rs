@@ -13,12 +13,23 @@
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::path::{Path, PathBuf};
 
+/// Interpret the value of an XDG base directory variable.
+///
+/// The XDG Base Directory specification requires these variables to hold
+/// absolute paths and says empty or relative values must be ignored, so the
+/// caller falls back to its default instead of resolving paths against the
+/// current working directory.
+fn xdg_env_path(value: Option<String>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|path| path.is_absolute())
+}
+
 /// Resolve the XDG config base directory.
 ///
-/// Returns `$XDG_CONFIG_HOME` if set, otherwise `$HOME/.config`.
+/// Returns `$XDG_CONFIG_HOME` if it is set to an absolute path, otherwise
+/// `$HOME/.config`.
 pub fn xdg_config_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = xdg_env_path(std::env::var("XDG_CONFIG_HOME").ok()) {
+        return Ok(path);
     }
     #[cfg(target_os = "windows")]
     if let Ok(path) = std::env::var("APPDATA") {
@@ -37,10 +48,11 @@ pub fn openshell_config_dir() -> Result<PathBuf> {
 
 /// Resolve the XDG state base directory.
 ///
-/// Returns `$XDG_STATE_HOME` if set, otherwise `$HOME/.local/state`.
+/// Returns `$XDG_STATE_HOME` if it is set to an absolute path, otherwise
+/// `$HOME/.local/state`.
 pub fn xdg_state_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = xdg_env_path(std::env::var("XDG_STATE_HOME").ok()) {
+        return Ok(path);
     }
     #[cfg(target_os = "windows")]
     if let Ok(path) = std::env::var("LOCALAPPDATA") {
@@ -59,10 +71,11 @@ pub fn openshell_state_dir() -> Result<PathBuf> {
 
 /// Resolve the XDG data base directory.
 ///
-/// Returns `$XDG_DATA_HOME` if set, otherwise `$HOME/.local/share`.
+/// Returns `$XDG_DATA_HOME` if it is set to an absolute path, otherwise
+/// `$HOME/.local/share`.
 pub fn xdg_data_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = xdg_env_path(std::env::var("XDG_DATA_HOME").ok()) {
+        return Ok(path);
     }
     #[cfg(target_os = "windows")]
     if let Ok(path) = std::env::var("LOCALAPPDATA") {
@@ -155,6 +168,23 @@ mod tests {
         // round-trip testing.
         let result = xdg_config_dir();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn xdg_env_path_accepts_absolute_path() {
+        let absolute = std::env::temp_dir().join("xdg");
+        assert_eq!(
+            xdg_env_path(Some(absolute.to_string_lossy().into_owned())),
+            Some(absolute)
+        );
+    }
+
+    #[test]
+    fn xdg_env_path_ignores_unset_empty_and_relative_values() {
+        assert_eq!(xdg_env_path(None), None);
+        assert_eq!(xdg_env_path(Some(String::new())), None);
+        assert_eq!(xdg_env_path(Some("relative/state".to_string())), None);
+        assert_eq!(xdg_env_path(Some("./state".to_string())), None);
     }
 
     #[test]
