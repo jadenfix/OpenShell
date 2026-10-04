@@ -58,20 +58,21 @@ docker run -d \
   -p 127.0.0.1:8080:8080 \
   -v openshell-state:/var/openshell \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v ~/openshell/supervisor/openshell-sandbox:~/openshell/supervisor/openshell-sandbox:ro \
+  -v "$HOME/openshell/supervisor/openshell-sandbox:$HOME/openshell/supervisor/openshell-sandbox:ro" \
   -e OPENSHELL_COMPUTE_DRIVER=docker \
   -e OPENSHELL_GRPC_ENDPOINT=http://host.openshell.internal:8080 \
-  -e OPENSHELL_DOCKER_SUPERVISOR_BIN=~/openshell/supervisor/openshell-sandbox \
+  -e OPENSHELL_DOCKER_SUPERVISOR_BIN="$HOME/openshell/supervisor/openshell-sandbox" \
   -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
   -e OPENSHELL_DISABLE_TLS=true \
   ghcr.io/nvidia/openshell/gateway:latest
 ```
 
-The volume mount uses `~/openshell/supervisor/openshell-sandbox` for both the host and container
-paths. The shell expands `~` in both halves before passing the argument to Docker, so both sides
-resolve to the same absolute path (e.g., `/home/user/openshell/supervisor/openshell-sandbox`).
-This satisfies the same-path requirement so the host Docker daemon can find the binary when
-creating sandbox containers.
+The volume mount uses `$HOME/openshell/supervisor/openshell-sandbox` for both the host and
+container paths. The shell expands `$HOME` in both halves before passing the argument to Docker, so
+both sides resolve to the same absolute path (e.g., `/home/user/openshell/supervisor/openshell-sandbox`).
+Do not use `~` here: shells expand only a leading `~`, so the container half would reach Docker as a
+relative path, which Docker rejects. This satisfies the same-path requirement so the host Docker
+daemon can find the binary when creating sandbox containers.
 
 Register the gateway with the CLI. If running on the same machine, use `--local`:
 
@@ -127,10 +128,10 @@ docker run -d \
   -p 127.0.0.1:8080:8080 \
   -v "$HOME/.local/state/openshell:/home/openshell/.local/state/openshell" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v ~/openshell/supervisor/openshell-sandbox:~/openshell/supervisor/openshell-sandbox:ro \
+  -v "$HOME/openshell/supervisor/openshell-sandbox:$HOME/openshell/supervisor/openshell-sandbox:ro" \
   -e OPENSHELL_COMPUTE_DRIVER=docker \
   -e OPENSHELL_GRPC_ENDPOINT=https://127.0.0.1:8080 \
-  -e OPENSHELL_DOCKER_SUPERVISOR_BIN=~/openshell/supervisor/openshell-sandbox \
+  -e OPENSHELL_DOCKER_SUPERVISOR_BIN="$HOME/openshell/supervisor/openshell-sandbox" \
   -e OPENSHELL_DB_URL=sqlite:/home/openshell/.local/state/openshell/openshell.db \
   -e OPENSHELL_LOCAL_TLS_DIR=/home/openshell/.local/state/openshell/tls \
   -e OPENSHELL_TLS_CERT=/home/openshell/.local/state/openshell/tls/server/tls.crt \
