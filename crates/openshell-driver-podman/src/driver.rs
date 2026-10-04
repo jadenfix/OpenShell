@@ -612,6 +612,7 @@ impl PodmanComputeDriver {
             .as_ref()
             .and_then(|spec| spec.resource_requirements.as_ref())
             .and_then(|requirements| driver_gpu_requirements(Some(requirements)));
+        container::validate_resource_limits(sandbox)?;
         let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
         driver_config.admit_mount_types(&self.config.resource_admission)?;
         Self::validate_gpu_request(gpu_requirements, &driver_config)?;
@@ -2800,6 +2801,41 @@ mod tests {
         };
 
         driver.validate_sandbox_create(&sandbox).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_rejects_invalid_resource_limits() {
+        use openshell_core::proto::compute::v1::{
+            DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+        };
+
+        let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig::default());
+        for (cpu_limit, memory_limit) in [("lots", ""), ("", "lots"), ("0.000001", ""), ("", "20E")]
+        {
+            let sandbox = DriverSandbox {
+                spec: Some(DriverSandboxSpec {
+                    template: Some(DriverSandboxTemplate {
+                        resources: Some(DriverResourceRequirements {
+                            cpu_limit: cpu_limit.to_string(),
+                            memory_limit: memory_limit.to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let err = driver
+                .validate_sandbox_create(&sandbox)
+                .await
+                .expect_err("invalid resource limit should be rejected");
+            assert!(
+                matches!(err, ComputeDriverError::Precondition(_)),
+                "cpu {cpu_limit:?} / memory {memory_limit:?}: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

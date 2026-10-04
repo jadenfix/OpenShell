@@ -448,6 +448,11 @@ struct LinuxDevice {
 const DEFAULT_CPU_QUOTA: u64 = 200_000;
 const DEFAULT_CPU_PERIOD: u64 = 100_000;
 const DEFAULT_MEMORY_LIMIT: u64 = 4_294_967_296; // 4 GiB
+/// Smallest CFS quota the kernel accepts (1 ms per period), i.e. 10m CPU.
+const MIN_CPU_QUOTA: u64 = 1_000;
+/// Podman's spec generator decodes CPU quota and memory limit as `int64`.
+#[allow(clippy::cast_sign_loss)]
+const MAX_RESOURCE_LIMIT: u64 = i64::MAX as u64;
 
 /// Resolve the OCI image reference for a sandbox, using the template image
 /// if provided, otherwise the driver's default image.
@@ -684,32 +689,55 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
     labels
 }
 
-/// Parse resource limits from the sandbox template, falling back to defaults.
-fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> ResourceLimits {
+/// Parse the CPU quota and memory limit from the sandbox template, falling
+/// back to defaults when a limit is not set.
+///
+/// Returns a precondition error when a limit is set but cannot be applied, so
+/// a malformed quantity is never silently replaced with the default.
+fn parse_resource_limits(sandbox: &DriverSandbox) -> Result<(u64, u64), ComputeDriverError> {
     let resources = sandbox
         .spec
         .as_ref()
         .and_then(|s| s.template.as_ref())
         .and_then(|t| t.resources.as_ref());
 
-    let cpu_micros = resources
-        .filter(|r| !r.cpu_limit.is_empty())
-        .and_then(|r| parse_cpu_to_microseconds(&r.cpu_limit))
-        .unwrap_or(DEFAULT_CPU_QUOTA);
+    let cpu_micros = match resources.map(|r| r.cpu_limit.trim()) {
+        Some(cpu_limit) if !cpu_limit.is_empty() => {
+            parse_cpu_to_microseconds(cpu_limit).map_err(ComputeDriverError::Precondition)?
+        }
+        _ => DEFAULT_CPU_QUOTA,
+    };
 
-    let mem_bytes = resources
-        .filter(|r| !r.memory_limit.is_empty())
-        .and_then(|r| parse_memory_to_bytes(&r.memory_limit))
-        .unwrap_or(DEFAULT_MEMORY_LIMIT);
+    let mem_bytes = match resources.map(|r| r.memory_limit.trim()) {
+        Some(memory_limit) if !memory_limit.is_empty() => {
+            parse_memory_to_bytes(memory_limit).map_err(ComputeDriverError::Precondition)?
+        }
+        _ => DEFAULT_MEMORY_LIMIT,
+    };
 
-    ResourceLimits {
+    Ok((cpu_micros, mem_bytes))
+}
+
+/// Check that the sandbox template's CPU and memory limits can be applied.
+pub fn validate_resource_limits(sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
+    parse_resource_limits(sandbox).map(|_| ())
+}
+
+/// Build resource limits from the sandbox template, falling back to defaults.
+fn build_resource_limits(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+) -> Result<ResourceLimits, ComputeDriverError> {
+    let (cpu_micros, mem_bytes) = parse_resource_limits(sandbox)?;
+
+    Ok(ResourceLimits {
         cpu: CpuLimits {
             quota: cpu_micros,
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
         pids: podman_pids_limit(config.sandbox_pids_limit).map(|limit| PidsLimits { limit }),
-    }
+    })
 }
 
 fn podman_pids_limit(value: Option<std::num::NonZeroI64>) -> Option<i64> {
@@ -1112,7 +1140,7 @@ fn build_base_spec(
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
     );
-    let resource_limits = build_resource_limits(sandbox, config);
+    let resource_limits = build_resource_limits(sandbox, config)?;
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
     if sandbox
@@ -1694,55 +1722,100 @@ fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
 /// Parse a Kubernetes-style CPU quantity to cgroup quota microseconds
 /// (for a 100ms period).
 ///
-/// Examples: `"500m"` → 50000, `"2"` → 200000, `"0.5"` → 50000.
-fn parse_cpu_to_microseconds(quantity: &str) -> Option<u64> {
-    let micros = if let Some(millis_str) = quantity.strip_suffix('m') {
-        let millis: u64 = millis_str.parse().ok()?;
-        // quota = millis * period / 1000
-        millis.checked_mul(100)?
-    } else {
-        let cores: f64 = quantity.parse().ok()?;
-        if cores <= 0.0 || cores.is_nan() || cores.is_infinite() {
-            return None;
-        }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let val = (cores * 100_000.0) as u64;
-        val
+/// Examples: `"500m"` → 50000, `"2"` → 200000, `"0.5"` → 50000. Quantities
+/// below 10m (the kernel's 1ms minimum quota) are rejected.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn parse_cpu_to_microseconds(quantity: &str) -> Result<u64, String> {
+    let invalid = || {
+        format!("invalid podman cpu_limit '{quantity}'; expected a decimal or millicore quantity")
     };
-    // A quota of 0 microseconds is invalid — treat as no limit.
-    if micros == 0 { None } else { Some(micros) }
+    let micros = if let Some(millis_str) = quantity.strip_suffix('m') {
+        let millis: u64 = millis_str.parse().map_err(|_| invalid())?;
+        // quota = millis * period / 1000
+        millis.checked_mul(100).ok_or_else(invalid)?
+    } else {
+        let cores: f64 = quantity.parse().map_err(|_| invalid())?;
+        if !cores.is_finite() || cores <= 0.0 {
+            return Err("podman cpu_limit must be greater than zero".to_string());
+        }
+        let micros = (cores * 100_000.0).round();
+        if micros > MAX_RESOURCE_LIMIT as f64 {
+            return Err(invalid());
+        }
+        micros as u64
+    };
+    if micros > MAX_RESOURCE_LIMIT {
+        return Err(invalid());
+    }
+    if micros < MIN_CPU_QUOTA {
+        return Err(format!(
+            "podman cpu_limit '{quantity}' is below the minimum of 10m (0.01 CPU)"
+        ));
+    }
+    Ok(micros)
 }
 
 /// Parse a Kubernetes-style memory quantity to bytes.
 ///
-/// Supports: `Ki`, `Mi`, `Gi`, `Ti` (binary) and `k`, `M`, `G`, `T`
-/// (decimal), as well as plain byte values.
-fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
-    let suffixes: &[(&str, u64)] = &[
-        ("Ei", 1024 * 1024 * 1024 * 1024 * 1024 * 1024),
-        ("Pi", 1024 * 1024 * 1024 * 1024 * 1024),
-        ("Ti", 1024 * 1024 * 1024 * 1024),
-        ("Gi", 1024 * 1024 * 1024),
-        ("Mi", 1024 * 1024),
-        ("Ki", 1024),
-        ("E", 1_000_000_000_000_000_000),
-        ("P", 1_000_000_000_000_000),
-        ("T", 1_000_000_000_000),
-        ("G", 1_000_000_000),
-        ("M", 1_000_000),
-        ("K", 1_000),
-        ("k", 1_000),
-    ];
+/// Supports: `Ki`, `Mi`, `Gi`, `Ti`, `Pi`, `Ei` (binary) and `k`/`K`, `M`,
+/// `G`, `T`, `P`, `E` (decimal), as well as plain byte values. The number
+/// may be fractional (`"1.5Gi"`); the result is rounded to whole bytes.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn parse_memory_to_bytes(quantity: &str) -> Result<u64, String> {
+    let invalid = || {
+        format!("invalid podman memory_limit '{quantity}'; expected a Kubernetes-style quantity")
+    };
+    let too_large = || format!("podman memory_limit '{quantity}' is too large");
 
-    for (suffix, multiplier) in suffixes {
-        if let Some(num_str) = quantity.strip_suffix(suffix) {
-            let num: u64 = num_str.parse().ok()?;
-            return num.checked_mul(*multiplier);
+    let number_end = quantity
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(quantity.len());
+    let (number, suffix) = quantity.split_at(number_end);
+    let multiplier: u64 = match suffix {
+        "" => 1,
+        "Ki" => 1 << 10,
+        "Mi" => 1 << 20,
+        "Gi" => 1 << 30,
+        "Ti" => 1 << 40,
+        "Pi" => 1 << 50,
+        "Ei" => 1 << 60,
+        "k" | "K" => 1_000,
+        "M" => 1_000_000,
+        "G" => 1_000_000_000,
+        "T" => 1_000_000_000_000,
+        "P" => 1_000_000_000_000_000,
+        "E" => 1_000_000_000_000_000_000,
+        _ => return Err(format!("invalid podman memory_limit suffix '{suffix}'")),
+    };
+
+    let bytes = if let Ok(whole) = number.parse::<u64>() {
+        whole.checked_mul(multiplier).ok_or_else(too_large)?
+    } else {
+        let amount: f64 = number.parse().map_err(|_| invalid())?;
+        if !amount.is_finite() {
+            return Err(invalid());
         }
+        let bytes = (amount * multiplier as f64).round();
+        if bytes > MAX_RESOURCE_LIMIT as f64 {
+            return Err(too_large());
+        }
+        bytes as u64
+    };
+    if bytes > MAX_RESOURCE_LIMIT {
+        return Err(too_large());
     }
-
-    // Plain bytes.
-    quantity.parse().ok()
+    if bytes == 0 {
+        return Err("podman memory_limit must be greater than zero".to_string());
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -1962,35 +2035,35 @@ mod tests {
 
     #[test]
     fn parse_cpu_millicore() {
-        assert_eq!(parse_cpu_to_microseconds("500m"), Some(50_000));
-        assert_eq!(parse_cpu_to_microseconds("1000m"), Some(100_000));
-        assert_eq!(parse_cpu_to_microseconds("250m"), Some(25_000));
+        assert_eq!(parse_cpu_to_microseconds("500m"), Ok(50_000));
+        assert_eq!(parse_cpu_to_microseconds("1000m"), Ok(100_000));
+        assert_eq!(parse_cpu_to_microseconds("250m"), Ok(25_000));
     }
 
     #[test]
     fn parse_cpu_whole_cores() {
-        assert_eq!(parse_cpu_to_microseconds("1"), Some(100_000));
-        assert_eq!(parse_cpu_to_microseconds("2"), Some(200_000));
-        assert_eq!(parse_cpu_to_microseconds("0.5"), Some(50_000));
+        assert_eq!(parse_cpu_to_microseconds("1"), Ok(100_000));
+        assert_eq!(parse_cpu_to_microseconds("2"), Ok(200_000));
+        assert_eq!(parse_cpu_to_microseconds("0.5"), Ok(50_000));
     }
 
     #[test]
     fn parse_memory_binary_suffixes() {
-        assert_eq!(parse_memory_to_bytes("256Mi"), Some(256 * 1024 * 1024));
-        assert_eq!(parse_memory_to_bytes("4Gi"), Some(4 * 1024 * 1024 * 1024));
-        assert_eq!(parse_memory_to_bytes("1Ki"), Some(1024));
+        assert_eq!(parse_memory_to_bytes("256Mi"), Ok(256 * 1024 * 1024));
+        assert_eq!(parse_memory_to_bytes("4Gi"), Ok(4 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory_to_bytes("1Ki"), Ok(1024));
     }
 
     #[test]
     fn parse_memory_decimal_suffixes() {
-        assert_eq!(parse_memory_to_bytes("1G"), Some(1_000_000_000));
-        assert_eq!(parse_memory_to_bytes("500M"), Some(500_000_000));
-        assert_eq!(parse_memory_to_bytes("1K"), Some(1_000));
+        assert_eq!(parse_memory_to_bytes("1G"), Ok(1_000_000_000));
+        assert_eq!(parse_memory_to_bytes("500M"), Ok(500_000_000));
+        assert_eq!(parse_memory_to_bytes("1K"), Ok(1_000));
     }
 
     #[test]
     fn parse_memory_plain_bytes() {
-        assert_eq!(parse_memory_to_bytes("1048576"), Some(1_048_576));
+        assert_eq!(parse_memory_to_bytes("1048576"), Ok(1_048_576));
     }
 
     #[test]
@@ -2012,7 +2085,7 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let limits = build_resource_limits(&sandbox, &config);
+        let limits = build_resource_limits(&sandbox, &config).unwrap();
 
         assert_eq!(limits.cpu.quota, 50_000);
         assert_eq!(limits.memory.limit, 2 * 1024 * 1024 * 1024);
@@ -2025,12 +2098,75 @@ mod tests {
         assert!(!serialized.contains("PidsLimit"));
     }
 
+    fn sandbox_with_resource_limits(cpu_limit: &str, memory_limit: &str) -> DriverSandbox {
+        use openshell_core::proto::compute::v1::{
+            DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+        };
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                resources: Some(DriverResourceRequirements {
+                    cpu_limit: cpu_limit.to_string(),
+                    memory_limit: memory_limit.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        sandbox
+    }
+
+    #[test]
+    fn container_spec_applies_fractional_memory_limits() {
+        let config = test_config();
+        for (memory_limit, expected) in [
+            ("1.5Gi", 1_610_612_736_u64),
+            ("0.5Gi", 536_870_912),
+            ("1.5G", 1_500_000_000),
+        ] {
+            let spec =
+                build_container_spec(&sandbox_with_resource_limits("1", memory_limit), &config);
+            assert_eq!(
+                spec["resource_limits"]["memory"]["limit"], expected,
+                "memory_limit {memory_limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_spec_rejects_invalid_resource_limits() {
+        let config = test_config();
+        for (cpu_limit, memory_limit) in [
+            ("0.000001", "1Gi"),
+            ("1m", "1Gi"),
+            ("two", "1Gi"),
+            ("1.5m", "1Gi"),
+            ("1", "20E"),
+            ("1", "lots"),
+            ("1", "1Qi"),
+            ("1", "0.1"),
+            ("1", "0Gi"),
+            ("1", "-1Gi"),
+        ] {
+            let sandbox = sandbox_with_resource_limits(cpu_limit, memory_limit);
+            let err = try_build_container_spec_with_token(&sandbox, &config, None).expect_err(
+                &format!("cpu {cpu_limit} / memory {memory_limit} should fail"),
+            );
+            assert!(
+                matches!(err, ComputeDriverError::Precondition(_)),
+                "cpu {cpu_limit} / memory {memory_limit}: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn container_spec_can_inherit_runtime_pids_limit() {
         let sandbox = test_sandbox("test-id", "test-name");
         let mut config = test_config();
         config.sandbox_pids_limit = None;
-        let limits = build_resource_limits(&sandbox, &config);
+        let limits = build_resource_limits(&sandbox, &config).unwrap();
 
         assert!(limits.pids.is_none());
     }
@@ -2755,15 +2891,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_cpu_negative_returns_none() {
-        assert_eq!(parse_cpu_to_microseconds("-1"), None);
-        assert_eq!(parse_cpu_to_microseconds("-500m"), None);
+    fn parse_cpu_negative_is_rejected() {
+        assert!(parse_cpu_to_microseconds("-1").is_err());
+        assert!(parse_cpu_to_microseconds("-500m").is_err());
     }
 
     #[test]
-    fn parse_cpu_zero_returns_none() {
-        assert_eq!(parse_cpu_to_microseconds("0m"), None);
-        assert_eq!(parse_cpu_to_microseconds("0"), None);
+    fn parse_cpu_zero_is_rejected() {
+        assert!(parse_cpu_to_microseconds("0m").is_err());
+        assert!(parse_cpu_to_microseconds("0").is_err());
     }
 
     fn test_sandbox(id: &str, name: &str) -> DriverSandbox {
