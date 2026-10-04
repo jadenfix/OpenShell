@@ -930,13 +930,23 @@ start_user_gateway() {
   fi
 
   as_target_user systemctl --user enable openshell-gateway
-  as_target_user systemctl --user restart openshell-gateway
-  as_target_user systemctl --user is-active --quiet openshell-gateway
+  # A failed start-up (for example a preflight error, or a gateway already
+  # waiting to restart) must reach the diagnostics, not a bare errexit.
+  if ! as_target_user systemctl --user restart openshell-gateway ||
+    ! as_target_user systemctl --user is-active --quiet openshell-gateway; then
+    user_gateway_start_error
+  fi
 
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
   wait_for_local_gateway_listener user_gateway_service_failed
   wait_for_local_gateway_status
+}
+
+# Dumps diagnostics and exits for a gateway user service that failed to start.
+user_gateway_start_error() {
+  dump_local_gateway_diagnostics
+  error "the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway"
 }
 
 # Succeeds when the gateway user service has failed or is waiting to restart
@@ -1054,10 +1064,10 @@ wait_for_local_gateway_listener() {
   done
 
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
-  dump_local_gateway_diagnostics
   if [ "$_service_failed" -eq 1 ]; then
-    error "the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway"
+    user_gateway_start_error
   fi
+  dump_local_gateway_diagnostics
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 

@@ -630,6 +630,46 @@ if [ "$(run_listener_wait "$restarting_unit")" != "5" ]; then
   exit 1
 fi
 
+# Runs start_user_gateway with errexit active, as install.sh does, against a
+# user service whose restart or post-restart state check fails.
+assert_user_gateway_start_failure_reports() {
+  local name=$1
+  local failing_command=$2
+  local status=0
+
+  set +e
+  (
+    set -e
+    as_target_user() {
+      case "$*" in
+        "systemctl --user ${failing_command}"*) return 3 ;;
+        *) return 0 ;;
+      esac
+    }
+    register_local_gateway() { echo "registered" >&2; }
+    dump_local_gateway_diagnostics() { echo "gateway diagnostics" >&2; }
+    info() { :; }
+    TARGET_USER=test-user
+    start_user_gateway
+  ) >"$out" 2>"$err"
+  status=$?
+  set -e
+
+  if [ "$status" -ne 1 ] || ! grep -Fq "gateway diagnostics" "$err" ||
+    [ "$(tail -n 1 "$err")" != "openshell: error: the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway" ]; then
+    echo "FAIL: ${name}: expected diagnostics and the service error, got status ${status}" >&2
+    cat "$err" >&2
+    exit 1
+  fi
+  if grep -Fq "registered" "$err"; then
+    echo "FAIL: ${name}: a gateway that failed to start must not be registered" >&2
+    exit 1
+  fi
+}
+
+assert_user_gateway_start_failure_reports "failed user service restart" restart
+assert_user_gateway_start_failure_reports "user service inactive after restart" is-active
+
 if [ "$(PLATFORM=darwin local_gateway_endpoint)" != "https://localhost:17670" ]; then
   echo "FAIL: macOS local gateway endpoint must use a TLS-compatible loopback hostname" >&2
   exit 1
