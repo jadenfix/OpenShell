@@ -630,6 +630,83 @@ if [ "$(run_listener_wait "$restarting_unit")" != "5" ]; then
   exit 1
 fi
 
+# The CLI stores registrations under $XDG_CONFIG_HOME/openshell. The installer
+# must look in, and hand the CLI, the same directory.
+xdg_home="${tmpdir}/xdg-user-home"
+xdg_config="${tmpdir}/xdg-config"
+for config_dir in "${xdg_home}/.config/openshell" "${xdg_config}/openshell"; do
+  mkdir -p "${config_dir}/gateways/openshell/mtls" "${config_dir}/gateways/local"
+  : >"${config_dir}/gateways/openshell/metadata.json"
+  printf 'openshell\n' >"${config_dir}/active_gateway"
+done
+
+actual="$(
+  PLATFORM=linux TARGET_UID="$(id -u)" TARGET_HOME="$xdg_home" TARGET_RUNTIME_DIR=/run/user/test \
+    XDG_CONFIG_HOME="$xdg_config" as_target_user sh -c 'printf "%s\n" "$XDG_CONFIG_HOME"'
+)"
+if [ "$actual" != "$xdg_config" ]; then
+  echo "FAIL: commands run as the installing user must keep its XDG_CONFIG_HOME, got ${actual}" >&2
+  exit 1
+fi
+actual="$(
+  unset XDG_CONFIG_HOME
+  PLATFORM=darwin TARGET_UID="$(id -u)" TARGET_HOME="$xdg_home" \
+    as_target_user sh -c 'printf "%s\n" "$XDG_CONFIG_HOME"'
+)"
+if [ "$actual" != "${xdg_home}/.config" ]; then
+  echo "FAIL: commands run as the target user must default XDG_CONFIG_HOME to its home, got ${actual}" >&2
+  exit 1
+fi
+actual="$(TARGET_UID=4294967294 TARGET_HOME="$xdg_home" XDG_CONFIG_HOME="$xdg_config" target_config_home)"
+if [ "$actual" != "${xdg_home}/.config" ]; then
+  echo "FAIL: another user's XDG_CONFIG_HOME must not apply to the target user, got ${actual}" >&2
+  exit 1
+fi
+
+if ! (
+  sleep() { :; }
+  info() { :; }
+  PLATFORM=linux
+  TARGET_UID="$(id -u)"
+  TARGET_HOME="$xdg_home"
+  TARGET_RUNTIME_DIR=/run/user/test
+  export XDG_CONFIG_HOME="$xdg_config"
+  : >"${xdg_config}/openshell/gateways/openshell/mtls/ca.crt"
+  : >"${xdg_config}/openshell/gateways/openshell/mtls/tls.crt"
+  : >"${xdg_config}/openshell/gateways/openshell/mtls/tls.key"
+  as_target_user() { :; }
+  OPENSHELL_INSTALL_GATEWAY_TIMEOUT=2 wait_for_local_gateway_listener
+) >"$out" 2>"$err"; then
+  echo "FAIL: the listener wait must read the mTLS bundle from XDG_CONFIG_HOME" >&2
+  cat "$err" >&2
+  exit 1
+fi
+
+if ! (
+  PLATFORM=linux
+  TARGET_UID="$(id -u)"
+  TARGET_HOME="$xdg_home"
+  TARGET_RUNTIME_DIR=/run/user/test
+  export XDG_CONFIG_HOME="$xdg_config"
+  remove_local_gateway_registration
+) >"$out" 2>"$err"; then
+  echo "FAIL: stale local gateway registration cleanup should succeed" >&2
+  cat "$err" >&2
+  exit 1
+fi
+if [ -e "${xdg_config}/openshell/gateways/local" ] ||
+  [ -e "${xdg_config}/openshell/gateways/openshell/metadata.json" ] ||
+  [ -e "${xdg_config}/openshell/active_gateway" ]; then
+  echo "FAIL: stale registration cleanup must clear the XDG_CONFIG_HOME registration" >&2
+  exit 1
+fi
+if [ ! -e "${xdg_home}/.config/openshell/gateways/local" ] ||
+  [ ! -e "${xdg_home}/.config/openshell/gateways/openshell/metadata.json" ] ||
+  [ ! -e "${xdg_home}/.config/openshell/active_gateway" ]; then
+  echo "FAIL: stale registration cleanup must not touch the unused ~/.config registration" >&2
+  exit 1
+fi
+
 if [ "$(PLATFORM=darwin local_gateway_endpoint)" != "https://localhost:17670" ]; then
   echo "FAIL: macOS local gateway endpoint must use a TLS-compatible loopback hostname" >&2
   exit 1

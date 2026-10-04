@@ -609,12 +609,25 @@ user_home() {
   echo "/home/${_user}"
 }
 
+# Base config directory the CLI uses for the target user. The caller's
+# XDG_CONFIG_HOME applies only when it belongs to the target user.
+target_config_home() {
+  if [ "$(id -u)" -eq "$TARGET_UID" ] && [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    printf '%s\n' "$XDG_CONFIG_HOME"
+  else
+    printf '%s/.config\n' "$TARGET_HOME"
+  fi
+}
+
+# Pass XDG_CONFIG_HOME explicitly so the CLI writes its registration where
+# this script reads and cleans it up, whatever sudo or runuser keep.
 as_target_user() {
+  _config_home="$(target_config_home)"
   if [ "${PLATFORM:-}" = "darwin" ]; then
     if [ "$(id -u)" -eq "$TARGET_UID" ]; then
-      env HOME="$TARGET_HOME" "$@"
+      env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$_config_home" "$@"
     elif has_cmd sudo; then
-      sudo -u "$TARGET_USER" env HOME="$TARGET_HOME" "$@"
+      sudo -u "$TARGET_USER" env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$_config_home" "$@"
     else
       error "cannot run commands as ${TARGET_USER}; install sudo or run as ${TARGET_USER}"
     fi
@@ -623,11 +636,11 @@ as_target_user() {
 
   _bus="unix:path=${TARGET_RUNTIME_DIR}/bus"
   if [ "$(id -u)" -eq "$TARGET_UID" ]; then
-    env HOME="$TARGET_HOME" XDG_RUNTIME_DIR="$TARGET_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="$_bus" "$@"
+    env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$_config_home" XDG_RUNTIME_DIR="$TARGET_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="$_bus" "$@"
   elif has_cmd sudo; then
-    sudo -u "$TARGET_USER" env HOME="$TARGET_HOME" XDG_RUNTIME_DIR="$TARGET_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="$_bus" "$@"
+    sudo -u "$TARGET_USER" env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$_config_home" XDG_RUNTIME_DIR="$TARGET_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="$_bus" "$@"
   elif has_cmd runuser; then
-    runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" XDG_RUNTIME_DIR="$TARGET_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="$_bus" "$@"
+    runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" XDG_CONFIG_HOME="$_config_home" XDG_RUNTIME_DIR="$TARGET_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="$_bus" "$@"
   else
     error "cannot run user service commands as ${TARGET_USER}; install sudo or run as ${TARGET_USER}"
   fi
@@ -1035,7 +1048,7 @@ wait_for_local_gateway_listener() {
   _last_output=""
   _service_failed=0
   _probe_url="$(local_gateway_endpoint)/"
-  _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
+  _mtls_dir="$(target_config_home)/openshell/gateways/openshell/mtls"
 
   info "waiting for local gateway listener to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
@@ -1111,7 +1124,7 @@ remove_local_gateway_registration_from() {
 }
 
 remove_local_gateway_registration() {
-  remove_local_gateway_registration_from "${TARGET_HOME}/.config/openshell"
+  remove_local_gateway_registration_from "$(target_config_home)/openshell"
 }
 
 remove_snap_gateway_registration() {
