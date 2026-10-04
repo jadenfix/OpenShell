@@ -2246,6 +2246,22 @@ fn expand_existing_access(
 }
 
 fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
+    if protocol.eq_ignore_ascii_case("graphql") {
+        let preset = openshell_policy_schema::AccessPreset::parse(access)?;
+        return Some(
+            preset
+                .graphql_operation_types()
+                .iter()
+                .map(|operation_type| L7Rule {
+                    allow: Some(L7Allow {
+                        operation_type: (*operation_type).to_string(),
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+        );
+    }
+
     let methods = openshell_policy_schema::expand_access_preset(protocol, access)?;
 
     Some(
@@ -2405,7 +2421,8 @@ mod tests {
     use super::{
         ANY_BINARY_SCOPE, DEFAULT_JSON_RPC_MAX_BODY_BYTES, L7BinaryScope, L7RuleTarget,
         PolicyMergeError, PolicyMergeOp, PolicyMergeWarning, canonical_ports,
-        canonicalize_advisor_add_rule, generated_rule_name, merge_policy, policy_covers_rule,
+        canonicalize_advisor_add_rule, expand_access_preset, generated_rule_name, merge_policy,
+        policy_covers_rule,
     };
     use crate::{restrictive_default_policy, validate_sandbox_policy};
     use openshell_core::{
@@ -4347,6 +4364,82 @@ mod tests {
             warning,
             PolicyMergeWarning::ExpandedAccessPreset { access, .. } if access == "read-write"
         )));
+    }
+
+    fn graphql_rule(operation_type: &str, operation_name: &str) -> L7Rule {
+        L7Rule {
+            allow: Some(L7Allow {
+                operation_type: operation_type.to_string(),
+                operation_name: operation_name.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn add_rule_expands_graphql_access_preset_to_operation_types() {
+        let existing = rule_with_authorizations(
+            "api",
+            vec![NetworkEndpoint {
+                path: "/graphql".to_string(),
+                protocol: "graphql".to_string(),
+                access: NetworkAccessPreset::ReadOnly as i32,
+                ..endpoint("api.example.com", 443)
+            }],
+            &["/usr/bin/agent"],
+        );
+        let incoming = rule_with_authorizations(
+            "api",
+            vec![NetworkEndpoint {
+                path: "/graphql".to_string(),
+                protocol: "graphql".to_string(),
+                rules: vec![graphql_rule("mutation", "CreateIssue")],
+                ..endpoint("api.example.com", 443)
+            }],
+            &["/usr/bin/agent"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("api", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "api".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("graphql presets should expand to operation_type rules");
+
+        let endpoint = &result.policy.network_policies["api"].endpoints[0];
+        assert_eq!(endpoint.access, NetworkAccessPreset::Unspecified as i32);
+        assert_eq!(
+            endpoint.rules,
+            vec![
+                graphql_rule("query", ""),
+                graphql_rule("mutation", "CreateIssue"),
+            ]
+        );
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            PolicyMergeWarning::ExpandedAccessPreset { access, .. } if access == "read-only"
+        )));
+    }
+
+    #[test]
+    fn graphql_access_presets_match_supervisor_expansion() {
+        assert_eq!(
+            expand_access_preset("graphql", "read-only"),
+            Some(vec![graphql_rule("query", "")])
+        );
+        assert_eq!(
+            expand_access_preset("graphql", "read-write"),
+            Some(vec![
+                graphql_rule("query", ""),
+                graphql_rule("mutation", "")
+            ])
+        );
+        assert_eq!(
+            expand_access_preset("graphql", "full"),
+            Some(vec![graphql_rule("*", "")])
+        );
     }
 
     #[test]

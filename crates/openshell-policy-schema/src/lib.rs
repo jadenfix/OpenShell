@@ -1103,6 +1103,19 @@ impl AccessPreset {
             (_, Self::ReadWrite) => &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"],
         }
     }
+
+    /// Expand a preset to the GraphQL operation types it represents.
+    ///
+    /// GraphQL endpoints authorize by `operation_type`, not by HTTP method, so
+    /// presets on a `graphql` endpoint expand to operation-type rules.
+    #[must_use]
+    pub fn graphql_operation_types(self) -> &'static [&'static str] {
+        match self {
+            Self::ReadOnly => &["query"],
+            Self::ReadWrite => &["query", "mutation"],
+            Self::Full => &["*"],
+        }
+    }
 }
 
 /// Expand a recognized access preset for a protocol.
@@ -1463,5 +1476,9 @@ network_policies:
             Some(&["GET", "WEBSOCKET_TEXT"][..])
         );
         assert_eq!(expand_access_preset("rest", "unknown"), None);
+        assert_eq!(
+            AccessPreset::ReadWrite.graphql_operation_types(),
+            &["query", "mutation"][..]
+        );
     }
 }
