@@ -4998,7 +4998,7 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    match upload_plan {
+    let uploaded_path = match upload_plan {
         SandboxUploadPlan::GitAware { base_dir, files } => {
             sandbox_sync_up_files(
                 server,
@@ -5011,13 +5011,18 @@ pub async fn sandbox_upload(
                 workspace,
             )
             .await?;
+            None
         }
         SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
+            Some(sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?)
         }
-    }
+    };
 
-    eprintln!("{} Upload complete", "✓".green().bold());
+    if let Some(path) = uploaded_path {
+        eprintln!("{} Upload complete: {path}", "✓".green().bold());
+    } else {
+        eprintln!("{} Upload complete", "✓".green().bold());
+    }
     Ok(())
 }
 
