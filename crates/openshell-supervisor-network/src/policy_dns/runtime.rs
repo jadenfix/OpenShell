@@ -7,6 +7,7 @@ use crate::opa::OpaEngine;
 use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
 use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
 use crate::policy_dns::{POLICY_LOCAL_ADDRESS, PolicyDnsService, SocketTrustedResolver, wire};
+use crate::proxy::{AcceptErrorBackoff, run_accept_loop};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
@@ -201,6 +202,7 @@ impl PolicyDnsRuntime {
             trusted_host_gateway,
         ));
         let address = udp.local_addr().into_diagnostic()?;
+        let tcp_address = tcp.local_addr().into_diagnostic()?;
 
         let udp_service = service.clone();
         let udp = Arc::new(udp);
@@ -211,12 +213,22 @@ impl PolicyDnsRuntime {
                 return;
             }
             let mut request = vec![0_u8; MAX_DNS_MESSAGE_BYTES + 1];
+            let mut recv_backoff = AcceptErrorBackoff::new("Policy DNS UDP receive", address);
             loop {
                 let Ok(permit) = udp_concurrency.clone().acquire_owned().await else {
                     break;
                 };
-                let Ok((length, peer)) = udp.recv_from(&mut request).await else {
-                    break;
+                let (length, peer) = match udp.recv_from(&mut request).await {
+                    Ok(received) => {
+                        recv_backoff.reset();
+                        received
+                    }
+                    Err(error) => {
+                        if recv_backoff.retry_after(&error).await {
+                            continue;
+                        }
+                        break;
+                    }
                 };
                 let request = request[..length].to_vec();
                 let service = udp_service.clone();
@@ -240,38 +252,41 @@ impl PolicyDnsRuntime {
             if tcp_engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
             }
-            loop {
-                let Ok((mut stream, _)) = tcp.accept().await else {
-                    break;
-                };
-                set_tcp_nodelay_best_effort(&stream);
-                let service = service.clone();
-                tokio::spawn(async move {
-                    // DNS-over-TCP connections may carry multiple sequential
-                    // length-prefixed messages. libc commonly reuses one
-                    // connection for A and AAAA during getaddrinfo().
-                    while let Ok(wire_length) = stream.read_u16().await {
-                        let length = usize::from(wire_length);
-                        if length > MAX_DNS_MESSAGE_BYTES {
-                            return;
+            run_accept_loop(
+                "Policy DNS TCP accept",
+                tcp_address,
+                || tcp.accept(),
+                |(mut stream, _)| {
+                    set_tcp_nodelay_best_effort(&stream);
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        // DNS-over-TCP connections may carry multiple sequential
+                        // length-prefixed messages. libc commonly reuses one
+                        // connection for A and AAAA during getaddrinfo().
+                        while let Ok(wire_length) = stream.read_u16().await {
+                            let length = usize::from(wire_length);
+                            if length > MAX_DNS_MESSAGE_BYTES {
+                                return;
+                            }
+                            let mut frame = Vec::with_capacity(length + 2);
+                            frame.extend_from_slice(&wire_length.to_be_bytes());
+                            frame.resize(length + 2, 0);
+                            if stream.read_exact(&mut frame[2..]).await.is_err() {
+                                return;
+                            }
+                            let Ok(response) =
+                                wire::handle_tcp_query_with_ipv6(&service, &frame, false).await
+                            else {
+                                return;
+                            };
+                            if stream.write_all(&response).await.is_err() {
+                                return;
+                            }
                         }
-                        let mut frame = Vec::with_capacity(length + 2);
-                        frame.extend_from_slice(&wire_length.to_be_bytes());
-                        frame.resize(length + 2, 0);
-                        if stream.read_exact(&mut frame[2..]).await.is_err() {
-                            return;
-                        }
-                        let Ok(response) =
-                            wire::handle_tcp_query_with_ipv6(&service, &frame, false).await
-                        else {
-                            return;
-                        };
-                        if stream.write_all(&response).await.is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
+                    });
+                },
+            )
+            .await;
         });
         let expiry_store = store.clone();
         let expiry_task = tokio::spawn(async move {

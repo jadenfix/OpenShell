@@ -415,8 +415,7 @@ impl ProxyHandle {
             // accept a window of requests concurrently.
             let (preauthorized_tx, mut preauthorized_rx) =
                 mpsc::channel(MEDIATION_ACCEPT_WINDOW * 2);
-            let mut consecutive_resource_errors: u32 = 0;
-            let mut consecutive_unknown_errors: u32 = 0;
+            let mut accept_backoff = AcceptErrorBackoff::new("Proxy accept", local_addr);
             loop {
                 let accepted = if let Some(source) = network_mediation_source.as_ref() {
                     let accepts = network_accepts
@@ -487,8 +486,7 @@ impl ProxyHandle {
                         let transparent_destination_addr = transparent_destination
                             .as_ref()
                             .map(|transparent| transparent.destination);
-                        consecutive_resource_errors = 0;
-                        consecutive_unknown_errors = 0;
+                        accept_backoff.reset();
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
@@ -552,17 +550,8 @@ impl ProxyHandle {
                         break;
                     }
                     Err(ProxyAcceptError::Listener(err)) => {
-                        let action = classify_accept_error(
-                            &err,
-                            &mut consecutive_resource_errors,
-                            &mut consecutive_unknown_errors,
-                        );
-                        ocsf_emit!(build_accept_error_event(local_addr, &err, &action));
-                        match action {
-                            AcceptAction::Terminal => break,
-                            AcceptAction::Retry { backoff, .. } => {
-                                tokio::time::sleep(backoff).await;
-                            }
+                        if !accept_backoff.retry_after(&err).await {
+                            break;
                         }
                     }
                 }
@@ -1041,40 +1030,46 @@ impl TransparentTcpHandle {
                         "Engine readiness signal not received within 15s; proceeding with transparent TCP accept loop"
                     );
                 }
-                loop {
-                    let Ok((stream, peer_addr)) = listener.accept().await else {
-                        break;
-                    };
-                    set_tcp_nodelay_best_effort(&stream);
-                    let store = store.clone();
-                    let engine = engine.clone();
-                    let cache = cache.clone();
-                    let pid = pid.clone();
-                    let proposals = proposals.clone();
-                    let denial_tx = denial_tx.clone();
-                    let activity_tx = activity_tx.clone();
-                    let upstream_proxy = upstream_proxy.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = handle_transparent_tcp_connection(
-                            stream,
-                            store,
-                            engine,
-                            cache,
-                            pid,
-                            proposals,
-                            denial_tx,
-                            activity_tx,
-                            upstream_proxy,
-                        )
-                        .await
-                        {
-                            ocsf_emit!(build_connection_error_event(
-                                peer_addr,
-                                format!("Transparent TCP connection error: {error}")
-                            ));
-                        }
-                    });
-                }
+                let local_addr = listener
+                    .local_addr()
+                    .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+                run_accept_loop(
+                    "Transparent TCP accept",
+                    local_addr,
+                    || listener.accept(),
+                    |(stream, peer_addr)| {
+                        set_tcp_nodelay_best_effort(&stream);
+                        let store = store.clone();
+                        let engine = engine.clone();
+                        let cache = cache.clone();
+                        let pid = pid.clone();
+                        let proposals = proposals.clone();
+                        let denial_tx = denial_tx.clone();
+                        let activity_tx = activity_tx.clone();
+                        let upstream_proxy = upstream_proxy.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = handle_transparent_tcp_connection(
+                                stream,
+                                store,
+                                engine,
+                                cache,
+                                pid,
+                                proposals,
+                                denial_tx,
+                                activity_tx,
+                                upstream_proxy,
+                            )
+                            .await
+                            {
+                                ocsf_emit!(build_connection_error_event(
+                                    peer_addr,
+                                    format!("Transparent TCP connection error: {error}")
+                                ));
+                            }
+                        });
+                    },
+                )
+                .await;
             }));
         }
         Ok(Self { joins })
@@ -1530,6 +1525,7 @@ enum AcceptAction {
 }
 
 fn build_accept_error_event(
+    operation: &str,
     local_addr: SocketAddr,
     err: &std::io::Error,
     action: &AcceptAction,
@@ -1537,12 +1533,12 @@ fn build_accept_error_event(
     let (severity, message) = match action {
         AcceptAction::Terminal => (
             SeverityId::High,
-            format!("Proxy accept loop exiting on terminal error: {err}"),
+            format!("{operation} loop exiting on terminal error: {err}"),
         ),
         AcceptAction::Retry { backoff, severity } => (
             *severity,
             format!(
-                "Proxy accept error (retrying in {}ms): {err}",
+                "{operation} error (retrying in {}ms): {err}",
                 backoff.as_millis()
             ),
         ),
@@ -1554,6 +1550,86 @@ fn build_accept_error_event(
         .status(StatusId::Failure)
         .message(message)
         .build()
+}
+
+/// Retry state shared by listener accept loops.
+///
+/// Transient accept errors (aborted handshakes, resource pressure, and
+/// similar) must not stop a listener permanently. Each error is classified,
+/// reported as an OCSF event, and either retried after a backoff or treated
+/// as terminal for the listener.
+pub(crate) struct AcceptErrorBackoff {
+    operation: &'static str,
+    local_addr: SocketAddr,
+    consecutive_resource_errors: u32,
+    consecutive_unknown_errors: u32,
+}
+
+impl AcceptErrorBackoff {
+    pub(crate) const fn new(operation: &'static str, local_addr: SocketAddr) -> Self {
+        Self {
+            operation,
+            local_addr,
+            consecutive_resource_errors: 0,
+            consecutive_unknown_errors: 0,
+        }
+    }
+
+    /// Clears the consecutive error counters after a successful accept.
+    pub(crate) const fn reset(&mut self) {
+        self.consecutive_resource_errors = 0;
+        self.consecutive_unknown_errors = 0;
+    }
+
+    /// Reports `err` and waits out its backoff. Returns `false` when the
+    /// error is terminal and the accept loop must exit.
+    pub(crate) async fn retry_after(&mut self, err: &std::io::Error) -> bool {
+        let action = classify_accept_error(
+            err,
+            &mut self.consecutive_resource_errors,
+            &mut self.consecutive_unknown_errors,
+        );
+        ocsf_emit!(build_accept_error_event(
+            self.operation,
+            self.local_addr,
+            err,
+            &action
+        ));
+        match action {
+            AcceptAction::Terminal => false,
+            AcceptAction::Retry { backoff, .. } => {
+                tokio::time::sleep(backoff).await;
+                true
+            }
+        }
+    }
+}
+
+/// Accepts from `accept` until it reports a terminal error, handing each
+/// accepted value to `on_accept`. Transient errors are retried with
+/// [`AcceptErrorBackoff`].
+pub(crate) async fn run_accept_loop<T, Fut>(
+    operation: &'static str,
+    local_addr: SocketAddr,
+    mut accept: impl FnMut() -> Fut,
+    mut on_accept: impl FnMut(T),
+) where
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    let mut backoff = AcceptErrorBackoff::new(operation, local_addr);
+    loop {
+        match accept().await {
+            Ok(accepted) => {
+                backoff.reset();
+                on_accept(accepted);
+            }
+            Err(err) => {
+                if !backoff.retry_after(&err).await {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn classify_accept_error(
@@ -9513,7 +9589,7 @@ network_policies:
                 severity: SeverityId::Low,
             },
         ] {
-            let event = build_accept_error_event(addr, &error, &action);
+            let event = build_accept_error_event("Proxy accept", addr, &error, &action);
             let json = event.to_json().unwrap();
             validate_required_fields(&json, &load_class_schema("network_activity"));
             assert_eq!(json["dst_endpoint"]["ip"], "127.0.0.1");
@@ -14994,6 +15070,50 @@ network_policies:
         let rx = handle.take_exit_receiver().expect("should return Some");
         drop(handle);
         assert!(rx.await.is_err());
+    }
+
+    // --- accept loop tests ---
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn accept_loop_retries_transient_errors_until_terminal() {
+        let addr: SocketAddr = "127.0.0.1:3128".parse().unwrap();
+        let mut results = std::collections::VecDeque::from([
+            Err(std::io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            Ok(1_u8),
+            Err(std::io::Error::from_raw_os_error(libc::ECONNRESET)),
+            Ok(2),
+            Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+        ]);
+        let mut accepted = Vec::new();
+        run_accept_loop(
+            "Test accept",
+            addr,
+            || std::future::ready(results.pop_front().expect("loop must stop on EBADF")),
+            |value| accepted.push(value),
+        )
+        .await;
+        assert_eq!(accepted, [1, 2]);
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_loop_stops_after_repeated_unknown_errors() {
+        let addr: SocketAddr = "127.0.0.1:3128".parse().unwrap();
+        let mut attempts = 0_u32;
+        run_accept_loop(
+            "Test accept",
+            addr,
+            || {
+                attempts += 1;
+                assert!(attempts <= MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS);
+                std::future::ready(Err::<(), _>(std::io::Error::other("unknown")))
+            },
+            |()| {},
+        )
+        .await;
+        assert_eq!(attempts, MAX_CONSECUTIVE_UNKNOWN_ACCEPT_ERRORS);
     }
 
     // --- classify_accept_error tests ---
