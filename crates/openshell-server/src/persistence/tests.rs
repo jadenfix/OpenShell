@@ -573,6 +573,126 @@ async fn sqlite_file_backed_reads_and_writes_proceed_concurrently() {
     );
 }
 
+/// Each successful CAS write must report the resource version it wrote, not
+/// whatever version a concurrent writer committed afterwards. On a
+/// file-backed store the pool has several connections, so a read-back after
+/// the UPDATE could observe another writer's commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_concurrent_cas_updates_report_distinct_versions() {
+    const WRITERS: u64 = 8;
+    const UPDATES_PER_WRITER: u64 = 25;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let store = std::sync::Arc::new(
+        Store::connect(&on_disk_store_url(&db_path))
+            .await
+            .expect("connect to sqlite"),
+    );
+    let sandbox = Sandbox {
+        metadata: Some(ProtoObjectMeta {
+            id: "cas-id".to_string(),
+            name: "cas-sandbox".to_string(),
+            workspace: "default".to_string(),
+            ..ProtoObjectMeta::default()
+        }),
+        ..Sandbox::default()
+    };
+    store.put_message(&sandbox).await.expect("seed sandbox");
+
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let mut versions = Vec::new();
+                for index in 0..UPDATES_PER_WRITER {
+                    let updated = loop {
+                        match store
+                            .update_message_cas::<Sandbox, _>("cas-id", 0, |s| {
+                                s.metadata
+                                    .as_mut()
+                                    .unwrap()
+                                    .annotations
+                                    .insert(format!("writer-{writer}"), index.to_string());
+                            })
+                            .await
+                        {
+                            Ok(updated) => break updated,
+                            Err(PersistenceError::Conflict { .. }) => {}
+                            Err(error) => panic!("unexpected CAS error: {error}"),
+                        }
+                    };
+                    versions.push(updated.metadata.unwrap().resource_version);
+                }
+                versions
+            })
+        })
+        .collect();
+
+    let mut versions = Vec::new();
+    for handle in handles {
+        versions.extend(handle.await.expect("writer task completed"));
+    }
+    versions.sort_unstable();
+    let expected: Vec<u64> = (2..=WRITERS * UPDATES_PER_WRITER + 1).collect();
+    assert_eq!(
+        versions, expected,
+        "every successful CAS write must report the distinct version it wrote"
+    );
+}
+
+/// Concurrent unconditional upserts of one name must each report the version
+/// their own write produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_concurrent_unconditional_puts_report_distinct_versions() {
+    const WRITERS: u64 = 8;
+    const PUTS_PER_WRITER: u64 = 25;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let store = std::sync::Arc::new(
+        Store::connect(&on_disk_store_url(&db_path))
+            .await
+            .expect("connect to sqlite"),
+    );
+
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|_| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let mut versions = Vec::new();
+                for _ in 0..PUTS_PER_WRITER {
+                    let result = store
+                        .put_if(
+                            "sandbox",
+                            "upsert-id",
+                            "upsert",
+                            "default",
+                            b"payload",
+                            None,
+                            super::WriteCondition::Unconditional,
+                        )
+                        .await
+                        .expect("unconditional put");
+                    versions.push(result.resource_version);
+                }
+                versions
+            })
+        })
+        .collect();
+
+    let mut versions = Vec::new();
+    for handle in handles {
+        versions.extend(handle.await.expect("writer task completed"));
+    }
+    versions.sort_unstable();
+    let expected: Vec<u64> = (1..=WRITERS * PUTS_PER_WRITER).collect();
+    assert_eq!(
+        versions, expected,
+        "every upsert must report the distinct version it wrote"
+    );
+}
+
 // The next three tests cover `restrict_db_file_permissions` against the
 // WAL/SHM sidecars at increasing levels of fidelity:
 //
