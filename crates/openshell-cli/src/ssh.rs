@@ -1355,8 +1355,7 @@ async fn ssh_tar_upload(
 ) -> Result<String> {
     let session = ssh_session_config(server, name, tls, workspace, None).await?;
     let mut dest_dir = dest.unwrap_or(".");
-    let mut expected_destination = None;
-    if let Some(path) = dest
+    let expected_destination = if let Some(path) = dest
         && let UploadSource::SinglePath {
             local_path,
             tar_name,
@@ -1371,8 +1370,10 @@ async fn ssh_tar_upload(
         let (directory, basename) = resolve_file_upload_destination(path, tar_name, kind);
         dest_dir = directory;
         *tar_name = basename;
-        expected_destination = Some((path, kind));
-    }
+        Some((path, kind))
+    } else {
+        None
+    };
     let final_path = match &source {
         UploadSource::SinglePath { tar_name, .. } => {
             format!(
