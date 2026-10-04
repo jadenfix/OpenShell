@@ -3172,7 +3172,7 @@ async fn run_cli_sandbox_create(
 }
 
 #[tokio::test]
-async fn sandbox_create_upload_stops_before_ssh_when_git_filtering_fails_or_is_empty() {
+async fn sandbox_create_upload_rejects_git_filtering_failures_before_provisioning() {
     let server = run_server().await;
     let source = tempfile::tempdir().unwrap();
     fs::create_dir(source.path().join("runs")).unwrap();
@@ -3188,12 +3188,8 @@ async fn sandbox_create_upload_stops_before_ssh_when_git_filtering_fails_or_is_e
     assert!(!result.status.success(), "{stderr}");
     assert!(stderr.contains("Git filtering failed"), "{stderr}");
     assert!(stderr.contains("--no-git-ignore"), "{stderr}");
-    assert!(
-        stderr.contains("Sandbox 'upload-no-repository' was created and still exists"),
-        "{stderr}",
-    );
-    assert!(stderr.contains("openshell sandbox upload"), "{stderr}");
-    assert!(stderr.contains("openshell sandbox delete"), "{stderr}");
+    assert!(stderr.contains("no sandbox was created"), "{stderr}");
+    assert!(!stderr.contains("was created and still exists"), "{stderr}");
 
     fs::remove_dir(source.path().join(".git")).unwrap();
     assert!(
@@ -3213,13 +3209,26 @@ async fn sandbox_create_upload_stops_before_ssh_when_git_filtering_fails_or_is_e
         "{stderr}"
     );
     assert!(stderr.contains("--no-git-ignore"), "{stderr}");
-    assert!(
-        stderr.contains("Sandbox 'upload-empty-selection' was created and still exists"),
-        "{stderr}",
-    );
-    // Upload rejection intentionally leaves the provisioned sandbox available
-    // for an explicit retry; it does not roll back sandbox creation.
-    assert_eq!(create_requests(&server).await.len(), 2);
+    assert!(stderr.contains("no sandbox was created"), "{stderr}");
+
+    // A valid earlier upload must not be provisioned or transferred when a
+    // later upload is rejected.
+    let valid = tempfile::tempdir().unwrap();
+    fs::write(valid.path().join("marker.txt"), "dummy content").unwrap();
+    let args = [
+        "--detach",
+        "--upload",
+        valid.path().to_str().unwrap(),
+        "--upload",
+        path.to_str().unwrap(),
+    ];
+    let result = run_cli_sandbox_create(&server, "upload-later-rejected", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("filtering selected no files"), "{stderr}");
+    assert!(stderr.contains("no sandbox was created"), "{stderr}");
+
+    assert_eq!(create_requests(&server).await.len(), 0);
     assert_eq!(
         server
             .openshell
@@ -3251,6 +3260,13 @@ async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
         "{stderr}"
     );
     assert!(!stderr.contains("Git filtering failed"), "{stderr}");
+    // A transfer failure after provisioning keeps the sandbox for a retry.
+    assert!(
+        stderr.contains("Sandbox 'upload-non-repository' was created and still exists"),
+        "{stderr}",
+    );
+    assert!(stderr.contains("openshell sandbox upload"), "{stderr}");
+    assert!(stderr.contains("openshell sandbox delete"), "{stderr}");
     assert_eq!(create_requests(&server).await.len(), 1);
     assert!(
         server

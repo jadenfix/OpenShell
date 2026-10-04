@@ -548,6 +548,14 @@ pub async fn sandbox_create(
         openshell_core::forward::check_port_available(spec)?;
     }
 
+    // Plan every upload before provisioning so that a locally detectable
+    // upload error leaves neither a sandbox nor a partial set of uploads.
+    let upload_plans = uploads
+        .iter()
+        .map(|(local_path, _, git_ignore)| sandbox_upload_plan(Path::new(local_path), *git_ignore))
+        .collect::<Result<Vec<_>>>()
+        .wrap_err("upload rejected before provisioning; no sandbox was created")?;
+
     let mut client = grpc_client(server, tls).await.wrap_err_with(|| {
         format!(
             "failed to connect to gateway '{gateway_name}' at {server}. \
@@ -1033,7 +1041,9 @@ pub async fn sandbox_create(
             drop(client);
 
             let upload_count = uploads.len();
-            for (idx, (local_path, sandbox_path, git_ignore)) in uploads.iter().enumerate() {
+            for (idx, ((local_path, sandbox_path, _), upload_plan)) in
+                uploads.iter().zip(upload_plans).enumerate()
+            {
                 let dest = sandbox_path.as_deref();
                 let dest_display = dest.unwrap_or("~");
                 if upload_count > 1 {
@@ -1050,12 +1060,7 @@ pub async fn sandbox_create(
                     );
                 }
                 let local = Path::new(local_path);
-                let upload_plan = sandbox_upload_plan(local, *git_ignore).wrap_err_with(|| {
-                    format!(
-                        "Sandbox '{sandbox_name}' was created and still exists.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
-                    )
-                })?;
-                match upload_plan {
+                let transfer = match upload_plan {
                     SandboxUploadPlan::GitAware { base_dir, files } => {
                         sandbox_sync_up_files(
                             &effective_server,
@@ -1067,7 +1072,7 @@ pub async fn sandbox_create(
                             &effective_tls,
                             workspace,
                         )
-                        .await?;
+                        .await
                     }
                     SandboxUploadPlan::Regular => {
                         sandbox_sync_up(
@@ -1078,9 +1083,14 @@ pub async fn sandbox_create(
                             &effective_tls,
                             workspace,
                         )
-                        .await?;
+                        .await
                     }
-                }
+                };
+                transfer.wrap_err_with(|| {
+                    format!(
+                        "Sandbox '{sandbox_name}' was created and still exists; earlier uploads may have completed.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
+                    )
+                })?;
                 eprintln!("  {} Files uploaded", "\u{2713}".green().bold());
             }
 
