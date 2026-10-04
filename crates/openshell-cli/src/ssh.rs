@@ -1438,16 +1438,42 @@ pub async fn sandbox_sync_up_files(
     if files.is_empty() {
         return Ok(());
     }
+    let (dest_dir, source) = file_list_upload_target(base_dir, files, local_path, dest);
+    retry_sandbox_sync("upload", || {
+        let source = source.clone();
+        async move { ssh_tar_upload(server, name, dest_dir, source, tls, workspace).await }
+    })
+    .await
+}
+
+/// Choose the extraction directory and archive layout for a Git-filtered
+/// upload.
+///
+/// A single-file source follows the same file-destination semantics as
+/// [`sandbox_sync_up`], so filtering never changes where the file lands.
+fn file_list_upload_target<'a>(
+    base_dir: &Path,
+    files: &[String],
+    local_path: &Path,
+    dest: Option<&'a str>,
+) -> (Option<&'a str>, UploadSource) {
+    if let [file] = files
+        && !local_path.is_dir()
+        && let Some((parent, target_name)) = file_upload_destination(dest)
+    {
+        let source = UploadSource::SinglePath {
+            local_path: base_dir.join(file),
+            tar_name: target_name.into(),
+        };
+        return (Some(parent), source);
+    }
+
     let source = UploadSource::FileList {
         base_dir: base_dir.to_path_buf(),
         files: files.to_vec(),
         archive_prefix: file_list_archive_prefix(local_path),
     };
-    retry_sandbox_sync("upload", || {
-        let source = source.clone();
-        async move { ssh_tar_upload(server, name, dest, source, tls, workspace).await }
-    })
-    .await
+    (dest, source)
 }
 
 /// Push a local path (file or directory) into a sandbox using tar-over-SSH.
@@ -1465,34 +1491,19 @@ pub async fn sandbox_sync_up(
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<()> {
-    // When an explicit destination is given and looks like a file path (does
-    // not end with '/'), split into parent directory + target basename so that
-    // `mkdir -p` creates the parent and tar extracts the file with the right
-    // name.
-    //
-    // Exception: if splitting would yield "/" as the parent, fall through to
-    // directory semantics instead. The sandbox user cannot write to "/" and
-    // the intent is almost certainly to place the file inside the named
-    // top-level directory.
     let local_path_is_file_like = local_upload_path_is_file_like(local_path);
-    if let Some(path) = sandbox_path
-        && local_path_is_file_like
-        && !path.ends_with('/')
+    if local_path_is_file_like
+        && let Some((parent, target_name)) = file_upload_destination(sandbox_path)
     {
-        let (parent, target_name) = split_sandbox_path(path);
-        if parent != "/" {
-            let source = UploadSource::SinglePath {
-                local_path: local_path.to_path_buf(),
-                tar_name: target_name.into(),
-            };
-            return retry_sandbox_sync("upload", || {
-                let source = source.clone();
-                async move {
-                    ssh_tar_upload(server, name, Some(parent), source, tls, workspace).await
-                }
-            })
-            .await;
-        }
+        let source = UploadSource::SinglePath {
+            local_path: local_path.to_path_buf(),
+            tar_name: target_name.into(),
+        };
+        return retry_sandbox_sync("upload", || {
+            let source = source.clone();
+            async move { ssh_tar_upload(server, name, Some(parent), source, tls, workspace).await }
+        })
+        .await;
     }
 
     let tar_name = if local_path_is_file_like {
@@ -1517,6 +1528,24 @@ pub async fn sandbox_sync_up(
         async move { ssh_tar_upload(server, name, sandbox_path, source, tls, workspace).await }
     })
     .await
+}
+
+/// Split an explicit single-file upload destination into its parent directory
+/// and target basename.
+///
+/// When the destination looks like a file path (does not end with '/'), the
+/// parent is created with `mkdir -p` and tar extracts the file under the
+/// destination's basename. Returns `None` for directory semantics: no
+/// destination, a trailing '/', or a split that would yield "/" as the parent.
+/// The sandbox user cannot write to "/" and the intent is almost certainly to
+/// place the file inside the named top-level directory.
+fn file_upload_destination(sandbox_path: Option<&str>) -> Option<(&str, &str)> {
+    let path = sandbox_path?;
+    if path.ends_with('/') {
+        return None;
+    }
+    let (parent, target_name) = split_sandbox_path(path);
+    (parent != "/").then_some((parent, target_name))
 }
 
 /// Compute the tar entry prefix for a directory upload.
@@ -3180,6 +3209,47 @@ mod tests {
         assert_eq!(entries[0].path, "dangling-link.txt");
         assert_eq!(entries[0].entry_type, tar::EntryType::Symlink);
         assert_eq!(entries[0].link_name.as_deref(), Some("missing.txt"));
+    }
+
+    #[test]
+    fn git_filtered_single_file_upload_honors_file_destination() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let local = tmpdir.path().join("foo.txt");
+        fs::write(&local, "foo").expect("write file");
+        let files = vec!["foo.txt".to_string()];
+
+        let (dest_dir, source) =
+            file_list_upload_target(tmpdir.path(), &files, &local, Some("/sandbox/bar.txt"));
+        assert_eq!(dest_dir, Some("/sandbox"));
+        assert_eq!(upload_archive_paths(source), vec!["bar.txt"]);
+
+        let (dest_dir, source) =
+            file_list_upload_target(tmpdir.path(), &files, &local, Some("/sandbox/out/"));
+        assert_eq!(dest_dir, Some("/sandbox/out/"));
+        assert_eq!(upload_archive_paths(source), vec!["foo.txt"]);
+
+        let (dest_dir, source) =
+            file_list_upload_target(tmpdir.path(), &files, &local, Some("/sandbox"));
+        assert_eq!(dest_dir, Some("/sandbox"));
+        assert_eq!(upload_archive_paths(source), vec!["foo.txt"]);
+
+        let (dest_dir, source) = file_list_upload_target(tmpdir.path(), &files, &local, None);
+        assert_eq!(dest_dir, None);
+        assert_eq!(upload_archive_paths(source), vec!["foo.txt"]);
+    }
+
+    #[test]
+    fn git_filtered_directory_upload_keeps_directory_destination() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let local = tmpdir.path().join("src");
+        fs::create_dir_all(&local).expect("create dir");
+        fs::write(local.join("a.txt"), "a").expect("write file");
+        let files = vec!["a.txt".to_string()];
+
+        let (dest_dir, source) =
+            file_list_upload_target(&local, &files, &local, Some("/sandbox/dest"));
+        assert_eq!(dest_dir, Some("/sandbox/dest"));
+        assert_eq!(upload_archive_paths(source), vec!["src/a.txt"]);
     }
 
     #[test]
