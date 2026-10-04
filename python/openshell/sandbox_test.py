@@ -18,7 +18,7 @@ import pytest
 
 import openshell.sandbox as sandbox_module
 from openshell._proto import openshell_pb2
-from openshell.mutations import DeletionOutcome
+from openshell.mutations import DeletionOutcome, DeletionResult
 from openshell.sandbox import (
     _OIDC_TOKEN_EXPIRY_GRACE_SECONDS,
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
@@ -30,6 +30,7 @@ from openshell.sandbox import (
     SandboxClient,
     SandboxError,
     SandboxRef,
+    SandboxSession,
     SandboxStatusRef,
     SandboxTemplateClient,
     ServiceAuthorizationMode,
@@ -2903,6 +2904,88 @@ def test_high_level_attach_rejects_workload_template() -> None:
 
     with pytest.raises(SandboxError):
         sandbox.__enter__()
+
+
+class _FailingEnterClient:
+    """A stand-in for SandboxClient whose create or readiness wait fails."""
+
+    def __init__(self, *, fail_create: bool = False) -> None:
+        self.fail_create = fail_create
+        self.calls: list[str] = []
+
+    def create_session(self, *, workspace: str, **_kwargs: Any) -> SandboxSession:
+        self.calls.append("create")
+        if self.fail_create:
+            raise SandboxError("create failed")
+        return SandboxSession(
+            cast("SandboxClient", self),
+            SandboxRef(
+                id="sandbox-1",
+                name="job-1",
+                workspace=workspace,
+                status=SandboxStatusRef(phase=1, current_policy_version=0),
+            ),
+        )
+
+    def wait_ready(self, name: str, **_kwargs: Any) -> SandboxRef:
+        self.calls.append("wait_ready")
+        raise SandboxError(f"sandbox {name} entered error phase")
+
+    def delete(
+        self, name: str, *, workspace: str, allow_missing: bool = False
+    ) -> DeletionResult:
+        self.calls.append(f"delete:{workspace}/{name}:{allow_missing}")
+        return DeletionResult(DeletionOutcome.COMPLETED, sandbox_id="sandbox-1")
+
+    def close(self) -> None:
+        self.calls.append("close")
+
+
+@pytest.mark.parametrize(
+    ("delete_on_exit", "expected_calls"),
+    [
+        (True, ["create", "wait_ready", "delete:staging/job-1:True", "close"]),
+        (False, ["create", "wait_ready", "close"]),
+    ],
+)
+def test_high_level_enter_cleans_up_when_wait_ready_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    delete_on_exit: bool,
+    expected_calls: list[str],
+) -> None:
+    fake = _FailingEnterClient()
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: fake),
+    )
+
+    sandbox = Sandbox(workspace="staging", delete_on_exit=delete_on_exit)
+    with pytest.raises(SandboxError, match="entered error phase"), sandbox:
+        pytest.fail("context body must not run when enter fails")
+
+    assert fake.calls == expected_calls
+    assert sandbox._client is None
+    assert sandbox._session is None
+
+
+def test_high_level_enter_closes_client_when_create_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FailingEnterClient(fail_create=True)
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: fake),
+    )
+
+    sandbox = Sandbox(workspace="staging")
+    with pytest.raises(SandboxError, match="create failed"), sandbox:
+        pytest.fail("context body must not run when enter fails")
+
+    assert fake.calls == ["create", "close"]
+    assert sandbox._client is None
+    assert sandbox._session is None
 
 
 # ---------------------------------------------------------------------------

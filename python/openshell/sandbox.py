@@ -1629,36 +1629,42 @@ class Sandbox:
         )
         self._client = client
 
-        if self._sandbox_input is None and self._workload_template is not None:
-            self._session = client.create_session_from_template(
-                workspace=self._workspace,
-                workload_template=self._workload_template,
-                spec=self._spec,
-                name=self._name,
-                labels=self._labels,
-            )
-        elif self._sandbox_input is None:
-            self._session = client.create_session(
-                workspace=self._workspace,
-                spec=self._spec,
-                name=self._name,
-                labels=self._labels,
-            )
-        elif isinstance(self._sandbox_input, SandboxRef):
-            self._session = SandboxSession(client, self._sandbox_input)
-        else:
-            self._session = client.get_session(
-                self._sandbox_input, workspace=self._workspace
-            )
+        # Python does not call __exit__ when __enter__ raises, so release the
+        # client (and the sandbox, when delete_on_exit is set) here.
+        try:
+            if self._sandbox_input is None and self._workload_template is not None:
+                self._session = client.create_session_from_template(
+                    workspace=self._workspace,
+                    workload_template=self._workload_template,
+                    spec=self._spec,
+                    name=self._name,
+                    labels=self._labels,
+                )
+            elif self._sandbox_input is None:
+                self._session = client.create_session(
+                    workspace=self._workspace,
+                    spec=self._spec,
+                    name=self._name,
+                    labels=self._labels,
+                )
+            elif isinstance(self._sandbox_input, SandboxRef):
+                self._session = SandboxSession(client, self._sandbox_input)
+            else:
+                self._session = client.get_session(
+                    self._sandbox_input, workspace=self._workspace
+                )
 
-        self._workspace = getattr(self._session, "_workspace", self._workspace)
+            self._workspace = getattr(self._session, "_workspace", self._workspace)
 
-        ready = client.wait_ready(
-            self._session.sandbox.name,
-            workspace=self._workspace,
-            timeout_seconds=self._ready_timeout_seconds,
-        )
-        self._session = SandboxSession(client, ready)
+            ready = client.wait_ready(
+                self._session.sandbox.name,
+                workspace=self._workspace,
+                timeout_seconds=self._ready_timeout_seconds,
+            )
+            self._session = SandboxSession(client, ready)
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
 
         return self
 
