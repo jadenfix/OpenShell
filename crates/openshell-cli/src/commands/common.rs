@@ -720,7 +720,7 @@ pub fn confirm_global_setting_delete(key: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Parse a duration string like "5m", "1h", "30s" into milliseconds.
+/// Parse a non-negative duration string like "5m", "1h", "30s" into milliseconds.
 pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
     let s = s.trim();
     if s.is_empty() {
@@ -743,9 +743,13 @@ pub fn parse_duration_to_ms(s: &str) -> Result<i64> {
             ));
         }
     };
-    num.checked_mul(multiplier).ok_or_else(|| {
+    let ms = num.checked_mul(multiplier).ok_or_else(|| {
         miette::miette!("duration out of range: {s} (must fit in milliseconds as a 64-bit integer)")
-    })
+    })?;
+    if ms < 0 {
+        return Err(miette::miette!("duration must not be negative: {s}"));
+    }
+    Ok(ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,6 +1099,18 @@ mod tests {
 
         let err = parse_duration_to_ms("-9223372036854775808h").expect_err("overflow should error");
         assert!(err.to_string().contains("duration out of range"));
+    }
+
+    #[test]
+    fn parse_duration_to_ms_rejects_negative_durations() {
+        for input in ["-5m", "-1s", "-9223372036854775s"] {
+            let err = parse_duration_to_ms(input).expect_err("negative duration should error");
+            assert!(
+                err.to_string().contains("must not be negative"),
+                "unexpected error for {input}: {err}"
+            );
+        }
+        assert_eq!(parse_duration_to_ms("0s").expect("parse"), 0);
     }
 
     #[test]
