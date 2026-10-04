@@ -1634,6 +1634,55 @@ def test_from_active_cluster_rejects_client_credentials_on_remote_plaintext(
         SandboxClient.from_active_cluster(client_credentials=auth)
 
 
+@pytest.mark.parametrize(
+    ("gateway_endpoint", "grpc_target"),
+    [
+        ("http://[::1]:8080", "[::1]:8080"),
+        ("https://[2001:db8::1]", "[2001:db8::1]:443"),
+        ("http://127.0.0.1:8080", "127.0.0.1:8080"),
+        ("https://gateway.example.com", "gateway.example.com:443"),
+    ],
+)
+def test_from_active_cluster_builds_grpc_target_from_endpoint(
+    tmp_path: Path,
+    monkeypatch: Any,
+    gateway_endpoint: str,
+    grpc_target: str,
+) -> None:
+    _setup_gateway_dir(tmp_path, monkeypatch, endpoint=gateway_endpoint)
+
+    client = SandboxClient.from_active_cluster()
+    try:
+        assert client._endpoint == grpc_target
+    finally:
+        client.close()
+
+
+def test_from_active_cluster_allows_client_credentials_on_ipv6_loopback(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    gateway_dir = _setup_gateway_dir(
+        tmp_path,
+        monkeypatch,
+        endpoint="http://[::1]:8080",
+        auth_mode="oidc",
+    )
+    metadata_path = gateway_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(
+        {
+            "oidc_issuer": "https://issuer.example.com",
+            "oidc_client_id": "service-client",
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata))
+
+    auth = ClientCredentialsAuth(client_secret="secret")
+    client = SandboxClient.from_active_cluster(client_credentials=auth)
+    client.close()
+
+
 def test_sandbox_client_rejects_ambiguous_bearer_configuration() -> None:
     auth = ClientCredentialsAuth(
         issuer="https://issuer.example.com",

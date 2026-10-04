@@ -753,6 +753,10 @@ class SandboxClient:
             raise SandboxError(f"gateway '{cluster_name}' metadata missing endpoint")
         parsed = urlparse(metadata["gateway_endpoint"])
         host = parsed.hostname or "127.0.0.1"
+        if ":" in host:
+            # urlparse strips the brackets from IPv6 literals; gRPC targets
+            # and _is_local_grpc_endpoint need them back.
+            host = f"[{host}]"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         endpoint = f"{host}:{port}"
 
