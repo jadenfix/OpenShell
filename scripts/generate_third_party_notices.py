@@ -48,6 +48,10 @@ SEPARATOR = "=" * 80
 THIN_SEP = "-" * 80
 
 
+class CollectorError(RuntimeError):
+    """A license collector could not run; the notices would be incomplete."""
+
+
 def find_repo_root() -> Path:
     """Walk up from CWD to find the directory containing .git."""
     path = Path.cwd()
@@ -77,13 +81,9 @@ def get_rust_notices() -> list[dict]:
             check=True,
         )
     except FileNotFoundError:
-        print(
-            "  WARNING: cargo-about not found, skipping Rust notices", file=sys.stderr
-        )
-        return []
+        raise CollectorError("cargo-about not found") from None
     except subprocess.CalledProcessError as e:
-        print(f"  WARNING: cargo-about failed: {e.stderr[:200]}", file=sys.stderr)
-        return []
+        raise CollectorError(f"cargo-about failed: {e.stderr[:200]}") from None
 
     data = json.loads(result.stdout)
     groups: list[dict] = []
@@ -146,11 +146,9 @@ def get_python_notices() -> list[dict]:
             check=True,
         )
     except FileNotFoundError:
-        print("  WARNING: uv not found, skipping Python notices", file=sys.stderr)
-        return []
+        raise CollectorError("uv not found") from None
     except subprocess.CalledProcessError as e:
-        print(f"  WARNING: pip-licenses failed: {e.stderr[:200]}", file=sys.stderr)
-        return []
+        raise CollectorError(f"pip-licenses failed: {e.stderr[:200]}") from None
 
     packages: list[dict] = []
     for pkg in json.loads(result.stdout):
@@ -249,16 +247,21 @@ def main() -> int:
     print("Generating third-party notices...")
     print()
 
-    print("Collecting Rust dependencies...")
-    rust_groups = get_rust_notices()
-    rust_count = sum(len(g["crates"]) for g in rust_groups)
-    print(f"  {rust_count} Rust packages across {len(rust_groups)} license groups")
-    print()
+    # A missing collector must not overwrite the file with a partial notice.
+    try:
+        print("Collecting Rust dependencies...")
+        rust_groups = get_rust_notices()
+        rust_count = sum(len(g["crates"]) for g in rust_groups)
+        print(f"  {rust_count} Rust packages across {len(rust_groups)} license groups")
+        print()
 
-    print("Collecting Python dependencies...")
-    python_packages = get_python_notices()
-    print(f"  {len(python_packages)} Python packages")
-    print()
+        print("Collecting Python dependencies...")
+        python_packages = get_python_notices()
+        print(f"  {len(python_packages)} Python packages")
+        print()
+    except CollectorError as e:
+        print(f"ERROR: {e}; THIRD-PARTY-NOTICES was not updated", file=sys.stderr)
+        return 1
 
     notices = format_notices(rust_groups, python_packages)
     output = root / "THIRD-PARTY-NOTICES"
