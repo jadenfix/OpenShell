@@ -680,10 +680,22 @@ mod tests {
             "forward-id",
             vec![
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // companion
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
+                // inspect channel
+                StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"no such volume"}"#),
                 // list_containers returns empty (container already gone)
                 StubResponse::new(StatusCode::OK, "[]"),
-                // remove_volume
+                // inspect and remove the owned workspace volume
+                StubResponse::new(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "Name": volume_name, "Driver": "local", "Options": {},
+                        "Labels": {
+                            openshell_core::driver_utils::LABEL_SANDBOX_ID: sandbox_id,
+                            openshell_core::driver_utils::LABEL_SANDBOX_WORKSPACE: "",
+                        }
+                    })
+                    .to_string(),
+                ),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -711,7 +723,7 @@ mod tests {
             .clone();
         assert!(requests[2].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[3],
+            requests[4],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))

@@ -765,6 +765,37 @@ impl PodmanClient {
         }
     }
 
+    /// Remove a sandbox-managed volume only when its labels prove ownership.
+    ///
+    /// A generated name is not proof of ownership: a volume that occupies
+    /// the name without this sandbox's ownership labels is preserved and
+    /// reported as [`PodmanApiError::InvalidInput`]. Idempotent (not-found
+    /// is ignored).
+    pub(crate) async fn remove_owned_volume(
+        &self,
+        name: &str,
+        sandbox_id: &str,
+    ) -> Result<(), PodmanApiError> {
+        let volume = match self.inspect_volume(name).await {
+            Ok(volume) => volume,
+            Err(PodmanApiError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let owned = volume.labels.as_ref().is_some_and(|labels| {
+            labels
+                .get(openshell_core::driver_utils::LABEL_SANDBOX_ID)
+                .map(String::as_str)
+                == Some(sandbox_id)
+                && labels.contains_key(openshell_core::driver_utils::LABEL_SANDBOX_WORKSPACE)
+        });
+        if !owned || volume.driver != "local" || !volume.options.is_empty() {
+            return Err(PodmanApiError::InvalidInput(format!(
+                "volume '{name}' is not owned by sandbox '{sandbox_id}'; preserving it"
+            )));
+        }
+        self.remove_volume(name).await
+    }
+
     /// Inspect a named volume. Does not create the volume.
     pub async fn inspect_volume(&self, name: &str) -> Result<VolumeInspect, PodmanApiError> {
         validate_name(name)?;
