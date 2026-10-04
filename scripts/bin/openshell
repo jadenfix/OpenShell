@@ -20,6 +20,29 @@ CALLER_PWD="$PWD"
 # also track HEAD so that branch switches / pulls are detected.
 # ---------------------------------------------------------------------------
 
+# Filter to paths that can affect the openshell-cli binary: the workspace
+# manifests, protos, and every workspace crate openshell-cli depends on,
+# directly or transitively (see `cargo metadata --no-deps`).
+matches_cli() {
+  local path=$1
+  case "$path" in
+    Cargo.toml|Cargo.lock|proto/*)
+      return 0 ;;
+    crates/openshell-cli/*|crates/openshell-core/*|crates/openshell-bootstrap/*)
+      return 0 ;;
+    crates/openshell-sdk/*|crates/openshell-extension-core/*)
+      return 0 ;;
+    crates/openshell-prover/*)
+      return 0 ;;
+    crates/openshell-policy/*|crates/openshell-policy-schema/*)
+      return 0 ;;
+    crates/openshell-providers/*|crates/openshell-tui/*)
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
 needs_build=0
 
 if [[ ! -x "$BINARY" ]]; then
@@ -41,23 +64,6 @@ else
       git ls-files --others --exclude-standard 2>/dev/null
     } | sort -u
   )
-
-  # Filter to paths that can affect the openshell-cli binary
-  matches_cli() {
-    local path=$1
-    case "$path" in
-      Cargo.toml|Cargo.lock|proto/*)
-        return 0 ;;
-      crates/openshell-cli/*|crates/openshell-core/*|crates/openshell-bootstrap/*)
-        return 0 ;;
-      crates/openshell-prover/*)
-        return 0 ;;
-      crates/openshell-policy/*|crates/openshell-providers/*|crates/openshell-tui/*)
-        return 0 ;;
-      *)
-        return 1 ;;
-    esac
-  }
 
   # Compute a composite fingerprint of matching dirty files
   payload=""
@@ -131,22 +137,6 @@ if [[ "$needs_build" == "1" ]]; then
       git ls-files --others --exclude-standard 2>/dev/null
     } | sort -u
   )
-
-  matches_cli() {
-    local path=$1
-    case "$path" in
-      Cargo.toml|Cargo.lock|proto/*)
-        return 0 ;;
-      crates/openshell-cli/*|crates/openshell-core/*|crates/openshell-bootstrap/*)
-        return 0 ;;
-      crates/openshell-prover/*)
-        return 0 ;;
-      crates/openshell-policy/*|crates/openshell-providers/*|crates/openshell-tui/*)
-        return 0 ;;
-      *)
-        return 1 ;;
-    esac
-  }
 
   post_payload=""
   for path in "${post_files[@]}"; do
