@@ -3,7 +3,8 @@
 
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
+    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningSettings,
+    UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
@@ -201,19 +202,35 @@ fn parse_request_parts(header_str: &str) -> RequestParts<'_> {
     }
 }
 
+/// S3 signing names. S3 verifies the signature against the request path
+/// exactly as sent, so its canonical URI must not be percent-encoded a
+/// second time or have dot segments normalized. Every other service uses
+/// the `SigV4` defaults (double encoding and normalization).
+const S3_SIGNING_NAMES: &[&str] = &["s3", "s3express", "s3-outposts"];
+
+fn signing_settings(service: &str) -> SigningSettings {
+    let mut settings = SigningSettings::default();
+    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    if S3_SIGNING_NAMES.contains(&service) {
+        settings.percent_encoding_mode = PercentEncodingMode::Single;
+        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    }
+    settings
+}
+
 fn build_signing_params<'a>(
     identity: &'a Identity,
     region: &'a str,
     service: &'a str,
+    time: SystemTime,
 ) -> Result<aws_sigv4::http_request::SigningParams<'a>> {
-    let mut settings = SigningSettings::default();
-    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    let settings = signing_settings(service);
 
     Ok(v4::SigningParams::builder()
         .identity(identity)
         .region(region)
         .name(service)
-        .time(SystemTime::now())
+        .time(time)
         .settings(settings)
         .build()
         .map_err(|e| miette!("SigV4 signing params: {e}"))?
@@ -284,7 +301,7 @@ pub fn apply_sigv4_to_request(
     let parts = parse_request_parts(header_str);
     let uri = format!("https://{host}{}", parts.path);
     let identity = build_identity(access_key, secret_key, session_token);
-    let signing_params = build_signing_params(&identity, region, service)?;
+    let signing_params = build_signing_params(&identity, region, service, SystemTime::now())?;
 
     let signable_request = SignableRequest::new(
         parts.method,
@@ -346,12 +363,37 @@ pub fn apply_sigv4_headers_only_with_body(
     session_token: Option<&str>,
     body: SignableBody<'_>,
 ) -> Result<Vec<u8>> {
+    sign_headers_only_at(
+        raw_headers,
+        host,
+        region,
+        service,
+        access_key,
+        secret_key,
+        session_token,
+        body,
+        SystemTime::now(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_headers_only_at(
+    raw_headers: &[u8],
+    host: &str,
+    region: &str,
+    service: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    body: SignableBody<'_>,
+    time: SystemTime,
+) -> Result<Vec<u8>> {
     let header_str = std::str::from_utf8(raw_headers)
         .map_err(|e| miette!("SigV4 signing: request headers are not valid UTF-8: {e}"))?;
     let parts = parse_request_parts(header_str);
     let uri = format!("https://{host}{}", parts.path);
     let identity = build_identity(access_key, secret_key, session_token);
-    let signing_params = build_signing_params(&identity, region, service)?;
+    let signing_params = build_signing_params(&identity, region, service, time)?;
 
     let signable_request = SignableRequest::new(
         parts.method,
@@ -563,6 +605,89 @@ mod tests {
         assert!(!result_str.contains("old-date"));
         assert!(!result_str.contains("old-hash"));
         assert!(result_str.contains("x-amz-content-sha256: UNSIGNED-PAYLOAD"));
+    }
+
+    const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+
+    /// 2013-05-24T00:00:00Z, the date used by the AWS `SigV4` examples.
+    fn test_signing_time() -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(380_376)
+    }
+
+    /// Computes the expected signature for an UNSIGNED-PAYLOAD PUT that signs
+    /// only `host`, using `canonical_uri` verbatim in the canonical request.
+    fn expected_unsigned_payload_signature(
+        canonical_uri: &str,
+        host: &str,
+        service: &str,
+    ) -> String {
+        use sha2::{Digest, Sha256};
+
+        let canonical_request = format!(
+            "PUT\n{canonical_uri}\n\nhost:{host}\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:20130524T000000Z\n\nhost;x-amz-content-sha256;x-amz-date\nUNSIGNED-PAYLOAD"
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n20130524T000000Z\n20130524/us-east-1/{service}/aws4_request\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let key =
+            v4::generate_signing_key(TEST_SECRET_KEY, test_signing_time(), "us-east-1", service);
+        v4::calculate_signature(key, string_to_sign.as_bytes())
+    }
+
+    /// Signs `PUT {path}` with UNSIGNED-PAYLOAD and returns the signature.
+    fn unsigned_payload_signature(path: &str, host: &str, service: &str) -> String {
+        let raw = format!("PUT {path} HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        let signed = sign_headers_only_at(
+            raw.as_bytes(),
+            host,
+            "us-east-1",
+            service,
+            "AKIAIOSFODNN7EXAMPLE",
+            TEST_SECRET_KEY,
+            None,
+            SignableBody::UnsignedPayload,
+            test_signing_time(),
+        )
+        .unwrap();
+        let signed = String::from_utf8(signed).unwrap();
+        assert!(
+            signed.starts_with(&format!("PUT {path} HTTP/1.1\r\n")),
+            "request line must be forwarded unchanged: {signed}"
+        );
+        signed
+            .split("Signature=")
+            .nth(1)
+            .and_then(|rest| rest.split("\r\n").next())
+            .expect("authorization header carries a signature")
+            .to_string()
+    }
+
+    #[test]
+    fn s3_signs_the_request_path_without_reencoding_or_normalizing() {
+        let host = "s3.us-east-1.amazonaws.com";
+        for service in ["s3", "s3express", "s3-outposts"] {
+            for path in [
+                "/bucket/my%20file.txt",
+                "/bucket/a/../b.txt",
+                "/bucket//key",
+            ] {
+                assert_eq!(
+                    unsigned_payload_signature(path, host, service),
+                    expected_unsigned_payload_signature(path, host, service),
+                    "{service} must sign {path} verbatim"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_s3_services_keep_double_uri_encoding() {
+        let host = "bedrock-runtime.us-east-1.amazonaws.com";
+        assert_eq!(
+            unsigned_payload_signature("/model/claude%3A0/invoke", host, "bedrock"),
+            expected_unsigned_payload_signature("/model/claude%253A0/invoke", host, "bedrock"),
+        );
     }
 
     #[test]
