@@ -1276,6 +1276,26 @@ fn parse_cpu_limit_supports_cores_and_millicores() {
 }
 
 #[test]
+fn parse_cpu_limit_rejects_values_below_minimum_quota() {
+    // Docker maps NanoCpus = 0 to "no limit", and the kernel rejects CFS
+    // quotas below 1 ms, so anything under 0.01 CPU cannot be applied.
+    for value in ["0.0000000001", "0.000001", "0.005", "1m", "9m"] {
+        let err = parse_cpu_limit(value).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{value}");
+    }
+    assert_eq!(parse_cpu_limit("10m").unwrap(), Some(10_000_000));
+    assert_eq!(parse_cpu_limit("0.01").unwrap(), Some(10_000_000));
+}
+
+#[test]
+fn parse_memory_limit_rejects_values_that_round_to_zero() {
+    // Docker maps Memory = 0 to "no limit".
+    let err = parse_memory_limit("0.1").unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(parse_memory_limit("0.5Ki").unwrap(), Some(512));
+}
+
+#[test]
 fn parse_memory_limit_supports_binary_quantities() {
     assert_eq!(parse_memory_limit("512Mi").unwrap(), Some(536_870_912));
     assert_eq!(parse_memory_limit("1G").unwrap(), Some(1_000_000_000));

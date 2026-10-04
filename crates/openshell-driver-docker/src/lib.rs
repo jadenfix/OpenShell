@@ -6002,7 +6002,7 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
                 "docker cpu_limit must be greater than zero",
             ));
         }
-        return Ok(Some(millicores.saturating_mul(1_000_000)));
+        return checked_nano_cpus(value, millicores.saturating_mul(1_000_000));
     }
 
     let cores = value.parse::<f64>().map_err(|_| {
@@ -6016,7 +6016,21 @@ fn parse_cpu_limit(value: &str) -> Result<Option<i64>, Status> {
         ));
     }
 
-    Ok(Some((cores * 1_000_000_000.0).round() as i64))
+    checked_nano_cpus(value, (cores * 1_000_000_000.0).round() as i64)
+}
+
+/// Smallest `NanoCpus` value Docker can apply: 0.01 CPU, which becomes the
+/// kernel's minimum CFS quota of 1 ms per 100 ms period. Docker treats 0 as
+/// "no limit", so smaller values must not reach the API.
+const MIN_DOCKER_NANO_CPUS: i64 = 10_000_000;
+
+fn checked_nano_cpus(value: &str, nano_cpus: i64) -> Result<Option<i64>, Status> {
+    if nano_cpus < MIN_DOCKER_NANO_CPUS {
+        return Err(Status::failed_precondition(format!(
+            "docker cpu_limit '{value}' is below the minimum of 10m (0.01 CPU)",
+        )));
+    }
+    Ok(Some(nano_cpus))
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -6062,7 +6076,14 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
         }
     };
 
-    Ok(Some((amount * multiplier).round() as i64))
+    let bytes = (amount * multiplier).round() as i64;
+    if bytes <= 0 {
+        // Docker treats a memory limit of 0 as "no limit".
+        return Err(Status::failed_precondition(format!(
+            "docker memory_limit '{value}' must be at least one byte",
+        )));
+    }
+    Ok(Some(bytes))
 }
 
 fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSandbox> {
