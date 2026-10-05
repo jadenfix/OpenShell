@@ -2080,6 +2080,19 @@ fn ssh_config_includes_path(contents: &str, path: &Path) -> bool {
     })
 }
 
+/// Read an SSH config file that is about to be rewritten, treating only a
+/// missing file as empty. Any other read error (permissions, invalid UTF-8)
+/// is returned so the caller never replaces a file it could not read.
+fn read_ssh_config_or_empty(path: &Path) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read {}", path.display())),
+    }
+}
+
 fn ensure_openshell_include(main_config: &Path, managed_config: &Path) -> Result<()> {
     if let Some(parent) = main_config.parent() {
         fs::create_dir_all(parent)
@@ -2088,7 +2101,7 @@ fn ensure_openshell_include(main_config: &Path, managed_config: &Path) -> Result
     }
 
     let include_line = render_include_line(managed_config);
-    let contents = fs::read_to_string(main_config).unwrap_or_default();
+    let contents = read_ssh_config_or_empty(main_config)?;
     let mut lines: Vec<&str> = contents.lines().collect();
     lines.retain(|line| !ssh_config_includes_path(line, managed_config));
 
@@ -2180,7 +2193,7 @@ pub fn install_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<
 
     let alias = host_alias(name, workspace);
     let block = render_ssh_config(gateway, name, workspace);
-    let contents = fs::read_to_string(&managed_config).unwrap_or_default();
+    let contents = read_ssh_config_or_empty(&managed_config)?;
     let updated = upsert_host_block(&contents, &alias, &block);
     fs::write(&managed_config, updated)
         .into_diagnostic()
@@ -2419,6 +2432,73 @@ mod tests {
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn ensure_openshell_include_preserves_unreadable_main_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_config = dir.path().join(".ssh").join("config");
+        fs::create_dir_all(main_config.parent().unwrap()).unwrap();
+        let original = b"Host personal\n    HostName caf\xe9.example.com\n".to_vec();
+        fs::write(&main_config, &original).unwrap();
+        let managed = dir.path().join("openshell").join("ssh_config");
+
+        let err = ensure_openshell_include(&main_config, &managed)
+            .expect_err("non-UTF-8 ~/.ssh/config must not be rewritten");
+        assert!(format!("{err:?}").contains("failed to read"), "{err:?}");
+        assert_eq!(fs::read(&main_config).unwrap(), original);
+    }
+
+    #[test]
+    fn ensure_openshell_include_creates_missing_main_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_config = dir.path().join(".ssh").join("config");
+        let managed = dir.path().join("openshell").join("ssh_config");
+
+        ensure_openshell_include(&main_config, &managed).unwrap();
+        assert_eq!(
+            fs::read_to_string(&main_config).unwrap(),
+            format!("{}\n", render_include_line(&managed))
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn install_ssh_config_preserves_unreadable_managed_config() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+        }
+
+        let managed = xdg.path().join("openshell").join("ssh_config");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        let original = b"Host openshell-other.default\n    User caf\xe9\n".to_vec();
+        fs::write(&managed, &original).unwrap();
+
+        let result = install_ssh_config("openshell", "demo", "default");
+        let managed_after = fs::read(&managed).unwrap();
+
+        unsafe {
+            match old_home {
+                Some(val) => std::env::set_var("HOME", val),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_xdg {
+                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let err = result.expect_err("non-UTF-8 managed config must not be rewritten");
+        assert!(format!("{err:?}").contains("failed to read"), "{err:?}");
+        assert_eq!(managed_after, original);
     }
 
     #[test]
