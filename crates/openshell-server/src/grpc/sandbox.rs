@@ -2876,7 +2876,17 @@ pub(super) fn validate_exec_start(req: &ExecSandboxRequest) -> Result<(), Status
             "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
         ));
     }
-    validate_exec_request_fields(req)
+    validate_exec_request_fields(req)?;
+    // Reject malformed requests before opening a supervisor relay, so a bad
+    // request never waits for or occupies a relay channel.
+    if let Some(timeout) = req.execution_timeout.as_ref() {
+        openshell_core::time::duration_to_std(timeout)
+            .map_err(|error| rpc_error::invalid_argument("execution_timeout", error.to_string()))?;
+    }
+    build_remote_exec_command(req).map_err(|error| {
+        rpc_error::invalid_argument("command", format!("command construction failed: {error}"))
+    })?;
+    Ok(())
 }
 
 fn validate_interactive_exec_start(
@@ -4202,6 +4212,69 @@ mod tests {
     }
 
     // ---- build_remote_exec_command ----
+
+    #[test]
+    fn validate_exec_start_rejects_negative_timeout_and_oversized_command() {
+        use openshell_core::proto::ExecSandboxRequest;
+
+        let negative_timeout = ExecSandboxRequest {
+            sandbox: "test".to_string(),
+            command: vec!["true".to_string()],
+            execution_timeout: Some(prost_types::Duration {
+                seconds: -1,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_exec_start(&negative_timeout).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+
+        // Each argument is within the per-argument limit, but the assembled
+        // command string exceeds MAX_COMMAND_STRING_LEN.
+        let oversized = ExecSandboxRequest {
+            sandbox: "test".to_string(),
+            command: vec!["a".repeat(30 * 1024); 10],
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_exec_start(&oversized).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_rejects_invalid_request_before_opening_relay() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("exec-invalid", Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // No supervisor session exists, so opening the relay would wait and
+        // then fail with UNAVAILABLE. Invalid input must be rejected first.
+        let started = std::time::Instant::now();
+        let error = handle_exec_sandbox(
+            &state,
+            authed_request(ExecSandboxRequest {
+                sandbox: sandbox.object_name().to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                command: vec!["true".to_string()],
+                execution_timeout: Some(prost_types::Duration {
+                    seconds: -1,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("negative timeout must be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "validation must not wait for a supervisor relay"
+        );
+    }
 
     #[test]
     fn build_remote_exec_command_basic() {
