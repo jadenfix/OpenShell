@@ -20,7 +20,7 @@ use openshell_core::{Error, Result as CoreResult};
 use reqwest::{Certificate, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 const DEFAULT_MOUNT: &str = "secret";
 const DEFAULT_AUTH_METHOD: &str = "kubernetes";
@@ -202,7 +202,6 @@ impl VaultCredentialDriver {
             &object_id,
             &logical_path,
         )?;
-        let token = self.auth_token().await?;
         let reference = VaultSecretReference {
             api_path: api_path_for_reference(
                 &self.settings.mount,
@@ -212,8 +211,11 @@ impl VaultCredentialDriver {
             key: STORED_VALUE_KEY.to_string(),
             kv_version: self.settings.kv_version,
         };
-        self.store_secret_value(&reference, &request.value, &token)
-            .await?;
+        let (reference, value) = (&reference, &request.value);
+        self.with_auth_token(|token| async move {
+            self.store_secret_value(reference, value, &token).await
+        })
+        .await?;
         Ok(CredentialHandle {
             driver: Self::NAME.to_string(),
             handle: format!("{HANDLE_VERSION}:{logical_path}"),
@@ -236,13 +238,16 @@ impl VaultCredentialDriver {
             &object_id,
             &logical_path,
         )?;
-        let token = self.auth_token().await?;
         let api_path = delete_api_path_for_reference(
             &self.settings.mount,
             self.settings.kv_version,
             &logical_path,
         );
-        self.delete_secret_value(&api_path, &token).await
+        let api_path = &api_path;
+        self.with_auth_token(
+            |token| async move { self.delete_secret_value(api_path, &token).await },
+        )
+        .await
     }
 
     pub async fn resolve_credentials(
@@ -274,21 +279,22 @@ impl VaultCredentialDriver {
             resolved_requests.push((request.request_id, reference));
         }
 
-        let token = self.auth_token().await?;
-        let futures = resolved_requests
-            .into_iter()
-            .map(|(request_id, reference)| {
-                let token = token.clone();
+        let resolved_requests = &resolved_requests;
+        self.with_auth_token(|token| async move {
+            let futures = resolved_requests.iter().map(|(request_id, reference)| {
+                let token = &token;
                 async move {
-                    let value = self.resolve_secret_value(&reference, &token).await?;
+                    let value = self.resolve_secret_value(reference, token).await?;
                     Ok::<_, Status>(ResolvedCredential {
-                        request_id,
+                        request_id: request_id.clone(),
                         value,
                         expiration_time: None,
                     })
                 }
             });
-        futures::future::try_join_all(futures).await
+            futures::future::try_join_all(futures).await
+        })
+        .await
     }
 
     fn handle_from_request(
@@ -311,11 +317,50 @@ impl VaultCredentialDriver {
         Ok(logical_path.to_string())
     }
 
-    async fn auth_token(&self) -> Result<String, Status> {
-        match &self.settings.auth {
-            VaultAuthSettings::TokenFile { token_path } => {
-                read_secret_file(token_path, "Vault token file").await
+    /// Run a Vault request with the driver token.
+    ///
+    /// When a cached Kubernetes-auth token is rejected (Vault answers 401 or
+    /// 403, for example after the token was revoked), evict it, log in again
+    /// and retry the request once with the new token.
+    async fn with_auth_token<T, F, Fut>(&self, request: F) -> Result<T, Status>
+    where
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = Result<T, Status>>,
+    {
+        let (token, cached) = self.auth_token().await?;
+        match request(token.clone()).await {
+            Err(status)
+                if cached
+                    && matches!(
+                        status.code(),
+                        Code::Unauthenticated | Code::PermissionDenied
+                    ) =>
+            {
+                self.evict_cached_token(&token).await;
+                let (token, _) = self.auth_token().await?;
+                request(token).await
             }
+            result => result,
+        }
+    }
+
+    /// Clear the cached Kubernetes-auth token if it is still `token`, so a
+    /// token refreshed concurrently by another request is kept.
+    async fn evict_cached_token(&self, token: &str) {
+        let mut cache = self.cached_token.lock().await;
+        if cache.as_ref().is_some_and(|cached| cached.token == token) {
+            *cache = None;
+        }
+    }
+
+    /// Return the Vault token and whether it came from the Kubernetes-auth
+    /// token cache.
+    async fn auth_token(&self) -> Result<(String, bool), Status> {
+        match &self.settings.auth {
+            VaultAuthSettings::TokenFile { token_path } => Ok((
+                read_secret_file(token_path, "Vault token file").await?,
+                false,
+            )),
             VaultAuthSettings::Kubernetes {
                 role,
                 auth_mount,
@@ -325,7 +370,7 @@ impl VaultCredentialDriver {
                 if let Some(cached) = cache.as_ref()
                     && Instant::now() < cached.valid_until
                 {
-                    return Ok(cached.token.clone());
+                    return Ok((cached.token.clone(), true));
                 }
                 let jwt = read_secret_file(
                     service_account_token_path,
@@ -340,7 +385,7 @@ impl VaultCredentialDriver {
                         valid_until: Instant::now() + ttl,
                     });
                 }
-                Ok(token)
+                Ok((token, false))
             }
         }
     }
@@ -1750,6 +1795,85 @@ mod tests {
             .unwrap();
 
         assert_eq!(resolved[0].value, "ghp-test");
+    }
+
+    #[tokio::test]
+    async fn kubernetes_auth_relogs_in_after_cached_token_is_rejected() {
+        let mock_server = MockServer::start().await;
+        let logical_path = managed_secret_path(
+            "test-workspace",
+            "test-provider-id",
+            "github-prod",
+            "GITHUB_TOKEN",
+            "test-provider-id",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/kubernetes/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "auth": { "client_token": "revoked-token", "lease_duration": 3600 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/kubernetes/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "auth": { "client_token": "fresh-token", "lease_duration": 3600 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let secret = serde_json::json!({ "data": { "data": { "value": "ghp-test" } } });
+        // The first token works once and is then revoked; Vault answers 403
+        // for revoked tokens.
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/secret/data/{logical_path}")))
+            .and(header("x-vault-token", "revoked-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret.clone()))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/secret/data/{logical_path}")))
+            .and(header("x-vault-token", "revoked-token"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/secret/data/{logical_path}")))
+            .and(header("x-vault-token", "fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(secret))
+            .mount(&mock_server)
+            .await;
+        let jwt_file = token_file("jwt-test\n");
+        let driver = VaultCredentialDriver::from_config(&table(&[
+            ("address", toml::Value::String(mock_server.uri())),
+            ("auth_method", toml::Value::String("kubernetes".to_string())),
+            ("role", toml::Value::String("openshell-gateway".to_string())),
+            (
+                "service_account_token_path",
+                toml::Value::String(jwt_file.path().display().to_string()),
+            ),
+        ]))
+        .unwrap();
+        let request = || ResolveCredentialRequest {
+            request_id: "credential-0".to_string(),
+            provider: "github-prod".to_string(),
+            credential_key: "GITHUB_TOKEN".to_string(),
+            handle: Some(handle(&format!("v1:{logical_path}"))),
+            workspace: "test-workspace".to_string(),
+            provider_id: "test-provider-id".to_string(),
+        };
+
+        let first = driver.resolve_credentials(vec![request()]).await.unwrap();
+        assert_eq!(first[0].value, "ghp-test");
+
+        let second = driver.resolve_credentials(vec![request()]).await.unwrap();
+        assert_eq!(second[0].value, "ghp-test");
+
+        let third = driver.resolve_credentials(vec![request()]).await.unwrap();
+        assert_eq!(third[0].value, "ghp-test");
     }
 
     #[tokio::test]
