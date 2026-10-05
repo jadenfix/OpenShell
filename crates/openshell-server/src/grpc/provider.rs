@@ -432,6 +432,12 @@ async fn update_provider_record_validating(
         .filter(|(_, value)| !value.is_empty())
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<HashMap<_, _>>();
+    let deleted_credential_keys = provider
+        .credentials
+        .iter()
+        .filter(|(_, value)| value.is_empty())
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
     candidate.credentials = merge_map(candidate.credentials, provider.credentials);
     candidate.config = merge_map(candidate.config, provider.config);
     for key in clear_credential_expiration_keys {
@@ -446,6 +452,11 @@ async fn update_provider_record_validating(
         candidate.credential_expiration_times,
         provider.credential_expiration_times,
     );
+    // A deleted credential takes its expiry with it; otherwise a later value
+    // stored under the same key would inherit the stale expiry.
+    for key in &deleted_credential_keys {
+        candidate.credential_expiration_times.remove(key);
+    }
 
     // Validate BEFORE writing to prevent persisting invalid state.
     // Validate only the mutable fields (credentials/config) plus metadata and
@@ -9612,6 +9623,70 @@ mod tests {
             !updated
                 .credential_expiration_times
                 .contains_key("API_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_record_drops_expiration_of_deleted_credential() {
+        let store = test_store().await;
+        let mut provider = provider_with_values("expiring-provider", "legacy-custom");
+        provider.credential_expiration_times.insert(
+            "SECONDARY".to_string(),
+            openshell_core::time::timestamp_from_millis(1_700_000_000_000).unwrap(),
+        );
+        create_provider_record(&store, "default", provider)
+            .await
+            .unwrap();
+
+        let update = |credentials: HashMap<String, String>| Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                name: "expiring-provider".to_string(),
+                ..Default::default()
+            }),
+            credentials,
+            ..Default::default()
+        };
+
+        let deleted = update_provider_record(
+            &store,
+            "default",
+            update(HashMap::from([("SECONDARY".to_string(), String::new())])),
+        )
+        .await
+        .unwrap();
+        assert!(!deleted.credentials.contains_key("SECONDARY"));
+        assert!(
+            !deleted
+                .credential_expiration_times
+                .contains_key("SECONDARY"),
+            "deleting a credential must drop its expiry"
+        );
+
+        update_provider_record(
+            &store,
+            "default",
+            update(HashMap::from([(
+                "SECONDARY".to_string(),
+                "new-secondary".to_string(),
+            )])),
+        )
+        .await
+        .unwrap();
+        // The update result redacts credential values; read the stored record.
+        let readded = store
+            .get_message_by_name::<Provider>("default", "expiring-provider")
+            .await
+            .unwrap()
+            .expect("provider");
+        assert_eq!(
+            readded.credentials.get("SECONDARY").map(String::as_str),
+            Some("new-secondary")
+        );
+        assert!(
+            !readded
+                .credential_expiration_times
+                .contains_key("SECONDARY"),
+            "a re-added credential without an expiry must not inherit the old one"
         );
     }
 
