@@ -5417,7 +5417,7 @@ pub async fn sandbox_policy_set(
             "{} Policy unchanged (version {}, hash: {})",
             "·".dimmed(),
             resp.version,
-            &resp.policy_hash[..12]
+            short_hash(&resp.policy_hash)
         );
         return Ok(());
     }
@@ -5426,7 +5426,7 @@ pub async fn sandbox_policy_set(
         "{} Policy version {} submitted (hash: {})",
         "✓".green().bold(),
         resp.version,
-        &resp.policy_hash[..12]
+        short_hash(&resp.policy_hash)
     );
 
     if !wait {

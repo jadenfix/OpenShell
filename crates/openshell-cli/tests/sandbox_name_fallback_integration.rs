@@ -38,6 +38,8 @@ use tonic::{Response, Status};
 #[derive(Clone, Default)]
 struct SandboxState {
     last_get_name: Arc<Mutex<Option<String>>>,
+    /// Policy version returned by `update_config`.
+    update_config_version: Arc<Mutex<u32>>,
 }
 
 #[derive(Clone, Default)]
@@ -496,7 +498,12 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
     ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        // A hash shorter than the 12 characters the CLI displays.
+        Ok(Response::new(openshell_core::proto::UpdateConfigResponse {
+            version: *self.state.update_config_version.lock().await,
+            policy_hash: "sha256:a".to_string(),
+            ..Default::default()
+        }))
     }
 
     async fn get_sandbox_policy_status(
@@ -505,6 +512,9 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
         let req = request.into_inner();
         assert_eq!(req.sandbox, "my-sandbox");
+        if req.version == 0 {
+            return Err(Status::not_found("no policy revision"));
+        }
         assert_eq!(req.version, 3);
         assert!(!req.global);
 
@@ -800,6 +810,33 @@ async fn run_server() -> TestServer {
 }
 
 // ── tests ─────────────────────────────────────────────────────────────
+
+/// `policy set` must not panic when the gateway reports a policy hash shorter
+/// than the abbreviated form the CLI prints, on both the submitted and the
+/// unchanged paths.
+#[tokio::test]
+async fn policy_set_tolerates_short_policy_hash() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let policy_path = dir.path().join("policy.yaml");
+    std::fs::write(&policy_path, "version: 1\n").unwrap();
+    let policy_path = policy_path.to_str().unwrap();
+
+    for version in [1, 0] {
+        *ts.openshell.state.update_config_version.lock().await = version;
+        run::sandbox_policy_set(
+            &ts.endpoint,
+            "my-sandbox",
+            policy_path,
+            false,
+            1,
+            "default",
+            &ts.tls,
+        )
+        .await
+        .expect("policy set should succeed");
+    }
+}
 
 /// Verify that `sandbox_get` works through a real gRPC round-trip and that the
 /// mock records the correct name.
