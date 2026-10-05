@@ -66,6 +66,10 @@ const JWKS_MAX_BYTES: usize = 1024 * 1024;
 pub struct JwksCache {
     keys: Arc<RwLock<HashMap<String, (DecodingKey, Algorithm)>>>,
     jwks_uri: String,
+    /// Issuer advertised by the discovery document. Tokens must carry this
+    /// exact `iss`; it can differ from the configured issuer by a trailing
+    /// slash.
+    issuer: String,
     ttl: Duration,
     last_refresh: Arc<RwLock<Instant>>,
     /// Timestamp of the last refresh that yielded at least one usable key.
@@ -640,6 +644,7 @@ impl JwksCache {
         let cache = Self {
             keys: Arc::new(RwLock::new(HashMap::new())),
             jwks_uri: jwks_uri.to_string(),
+            issuer: discovery.issuer.clone(),
             ttl: Duration::from_secs(config.jwks_ttl_secs),
             last_refresh: Arc::new(RwLock::new(
                 Instant::now()
@@ -840,7 +845,7 @@ impl JwksCache {
         }
 
         let mut validation = Validation::new(cached_algorithm);
-        validation.set_issuer(&[&self.config.issuer]);
+        validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&[&self.config.audience]);
         validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
 
@@ -1397,15 +1402,26 @@ mod tests {
     /// Serve an OIDC discovery document and a JWKS carrying the test key, then
     /// build a cache against them the same way production does.
     async fn cache_with_mock_issuer(server: &wiremock::MockServer) -> JwksCache {
+        let issuer = server.uri();
+        cache_with_issuers(server, issuer.clone(), issuer).await
+    }
+
+    /// Like [`cache_with_mock_issuer`], but the configured issuer and the
+    /// issuer advertised by discovery may differ (e.g. by a trailing slash).
+    async fn cache_with_issuers(
+        server: &wiremock::MockServer,
+        configured_issuer: String,
+        discovery_issuer: String,
+    ) -> JwksCache {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
-        let issuer = server.uri();
+        let base = server.uri();
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "issuer": issuer,
-                "jwks_uri": format!("{issuer}/jwks"),
+                "issuer": discovery_issuer,
+                "jwks_uri": format!("{base}/jwks"),
             })))
             .mount(server)
             .await;
@@ -1423,7 +1439,7 @@ mod tests {
             .await;
 
         JwksCache::new(&OidcConfig {
-            issuer,
+            issuer: configured_issuer,
             dangerously_allow_insecure_http: true,
             jwks_allowed_origins: Vec::new(),
             audience: TEST_AUDIENCE.to_owned(),
@@ -1435,6 +1451,43 @@ mod tests {
         })
         .await
         .expect("cache should build from the mock issuer")
+    }
+
+    /// Discovery may advertise the issuer with a different trailing slash than
+    /// the configuration. Tokens carry the discovery value, which is the one
+    /// OIDC requires them to match exactly.
+    #[tokio::test]
+    async fn tokens_match_the_discovered_issuer_across_trailing_slash_differences() {
+        for (configured_slash, discovered_slash) in [("", "/"), ("/", "")] {
+            let server = wiremock::MockServer::start().await;
+            let base = server.uri();
+            let discovered = format!("{base}{discovered_slash}");
+            let cache = cache_with_issuers(
+                &server,
+                format!("{base}{configured_slash}"),
+                discovered.clone(),
+            )
+            .await;
+
+            let token = mint_rs256(
+                &claims_for(&discovered, TEST_AUDIENCE, now_secs() + 3600),
+                TEST_KID,
+            );
+            cache
+                .validate_token(&token)
+                .await
+                .expect("a token carrying the discovered issuer must be accepted");
+
+            let configured_only = format!("{base}{configured_slash}");
+            let token = mint_rs256(
+                &claims_for(&configured_only, TEST_AUDIENCE, now_secs() + 3600),
+                TEST_KID,
+            );
+            cache
+                .validate_token(&token)
+                .await
+                .expect_err("issuer matching stays exact against the discovered value");
+        }
     }
 
     #[tokio::test]
