@@ -3502,9 +3502,13 @@ impl KubernetesComputeDriver {
                                     .as_ref()
                                     .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
                                     .unwrap_or_default();
+                                // Fence on the UID only. The controller keeps
+                                // updating status, so the listed
+                                // resourceVersion is often stale by DELETE time
+                                // and a 409 must mean only "replaced".
                                 let pc = Preconditions {
                                     uid: obj.metadata.uid,
-                                    resource_version: obj.metadata.resource_version,
+                                    resource_version: None,
                                 };
                                 let pod_name = obj
                                     .metadata
@@ -11322,6 +11326,81 @@ mod tests {
             Vec::new(),
         );
         assert!(shared.read_client_tls_material().await.unwrap().is_none());
+    }
+
+    /// The controller updates Sandbox status continuously, so the
+    /// resourceVersion seen by the lookup LIST is routinely stale by the time
+    /// DELETE runs. The DELETE must be fenced on the UID only; a stale
+    /// resourceVersion would turn into a 409 that reads as "already gone".
+    #[tokio::test]
+    async fn delete_sandbox_preconditions_on_uid_only() {
+        const SANDBOXES: &str = "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes";
+        const SANDBOX: &str =
+            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
+        let sandbox = serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "sandbox-cr",
+                "namespace": "openshell",
+                "uid": "cr-uid",
+                "resourceVersion": "42",
+                "labels": {LABEL_SANDBOX_ID: "sandbox-1"},
+                "annotations": {SANDBOX_POD_NAME_ANNOTATION: "workload-pod"}
+            }
+        });
+        let (driver, steps, bodies) = scripted_driver(
+            KubernetesComputeConfig {
+                namespace: "openshell".into(),
+                gateway_id: "gateway-a".into(),
+                ..Default::default()
+            },
+            vec![
+                (
+                    http::Method::GET,
+                    SANDBOXES,
+                    kube_test_response(
+                        http::StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": "agents.x-k8s.io/v1beta1",
+                            "kind": "SandboxList",
+                            "items": [sandbox.clone()]
+                        }),
+                    ),
+                ),
+                (
+                    http::Method::DELETE,
+                    SANDBOX,
+                    kube_test_response(http::StatusCode::OK, sandbox),
+                ),
+                (
+                    http::Method::GET,
+                    "/api/v1/namespaces/openshell/pods/workload-pod",
+                    kube_test_not_found("pods", "workload-pod"),
+                ),
+                (
+                    http::Method::GET,
+                    SANDBOX,
+                    kube_test_not_found("sandboxes", "sandbox-cr"),
+                ),
+            ],
+        );
+        driver
+            .sandbox_api_version
+            .set(SANDBOX_VERSION_V1BETA1)
+            .unwrap();
+
+        let deleted = driver
+            .delete_sandbox("sandbox-1")
+            .await
+            .expect("delete succeeds");
+
+        assert!(deleted, "an existing sandbox is reported as deleted");
+        assert!(steps.lock().unwrap().is_empty());
+        assert_eq!(
+            bodies.lock().unwrap()[0]["preconditions"],
+            serde_json::json!({"uid": "cr-uid"})
+        );
     }
 
     #[tokio::test]
