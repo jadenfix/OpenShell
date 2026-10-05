@@ -79,7 +79,7 @@ impl RegisteredSetting {
 ///
 /// When true, the supervisor installs the `policy_advisor` skill, serves
 /// the `policy.local` API routes, and includes `next_steps` in L7 deny
-/// bodies. See `crates/openshell-sandbox/src/policy_local.rs`. Defaults to
+/// bodies. See `crates/openshell-supervisor-network/src/policy_local.rs`. Defaults to
 /// false. Independent of the per-proposal developer approval gate, which
 /// still applies when this flag is on.
 pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_enabled";
