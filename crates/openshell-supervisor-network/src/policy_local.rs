@@ -161,6 +161,19 @@ pub async fn handle_forward_request<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Only Content-Length framed bodies are supported. Reading a chunked
+    // body as Content-Length 0 would route an empty request.
+    if has_transfer_encoding(initial_request) {
+        return write_json_response(
+            client,
+            411,
+            error_payload(
+                "length_required",
+                "policy.local requires a Content-Length request body; Transfer-Encoding is not supported".to_string(),
+            ),
+        )
+        .await;
+    }
     let body = read_request_body(initial_request, client).await?;
     let (status, payload) = route_request(ctx, method, path, &body).await;
     write_json_response(client, status, payload).await
@@ -1281,6 +1294,15 @@ fn parse_content_length(headers: &[u8]) -> Result<usize> {
     Ok(0)
 }
 
+fn has_transfer_encoding(request: &[u8]) -> bool {
+    let header_end = find_header_end(request).unwrap_or(request.len());
+    String::from_utf8_lossy(&request[..header_end])
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+}
+
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -1320,6 +1342,7 @@ fn status_text(status: u16) -> &'static str {
         202 => "Accepted",
         400 => "Bad Request",
         404 => "Not Found",
+        411 => "Length Required",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -1865,6 +1888,38 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["format"], "yaml");
         assert!(body["policy_yaml"].as_str().unwrap().contains("version: 1"));
+    }
+
+    #[tokio::test]
+    async fn chunked_request_body_is_rejected_with_length_required() {
+        let ctx = PolicyLocalContext::new(
+            None,
+            None,
+            None,
+            AgentProposals::new(true),
+            test_workspace_rx(),
+        );
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let request = b"POST http://policy.local/v1/proposals HTTP/1.1\r\nHost: policy.local\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n";
+        let task = tokio::spawn(async move {
+            handle_forward_request(&ctx, "POST", "/v1/proposals", request, &mut server)
+                .await
+                .unwrap();
+        });
+
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        task.await.unwrap();
+
+        let response = String::from_utf8(received).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 411 Length Required\r\n"),
+            "unexpected response: {response}"
+        );
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["error"], "length_required");
     }
 
     #[test]
