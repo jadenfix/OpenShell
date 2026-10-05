@@ -3385,36 +3385,10 @@ fn token_grant_override_matches_endpoint(
     host_matches && port_matches
 }
 
+/// Match with the same DNS-label glob semantics the supervisor uses when it
+/// selects a dynamic credential for a request.
 fn host_pattern_matches(pattern: &str, host: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let host = host.to_ascii_lowercase();
-    if pattern == host {
-        return true;
-    }
-    if !pattern.contains('*') {
-        return false;
-    }
-
-    let pattern_labels: Vec<&str> = pattern.split('.').collect();
-    let host_labels: Vec<&str> = host.split('.').collect();
-    host_pattern_labels_match(&pattern_labels, &host_labels)
-}
-
-fn host_pattern_labels_match(pattern: &[&str], host: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => host.is_empty(),
-        Some((label, rest)) if *label == "**" => {
-            host_pattern_labels_match(rest, host)
-                || (!host.is_empty() && host_pattern_labels_match(pattern, &host[1..]))
-        }
-        Some((label, rest)) if *label == "*" => {
-            !host.is_empty() && host_pattern_labels_match(rest, &host[1..])
-        }
-        Some((literal, rest)) => {
-            host.first().is_some_and(|label| label == literal)
-                && host_pattern_labels_match(rest, &host[1..])
-        }
-    }
+    openshell_core::host_pattern::host_matches(pattern, host).unwrap_or(false)
 }
 
 fn dynamic_token_grant_match_score(host: &str, path: &str) -> u32 {
@@ -3443,42 +3417,7 @@ fn count_as_u32(count: usize) -> u32 {
 }
 
 fn host_patterns_can_overlap(first: &str, second: &str) -> bool {
-    let first = first.to_ascii_lowercase();
-    let second = second.to_ascii_lowercase();
-    if !first.contains('*') {
-        return host_pattern_matches(&second, &first);
-    }
-    if !second.contains('*') {
-        return host_pattern_matches(&first, &second);
-    }
-    let first_labels: Vec<&str> = first.split('.').collect();
-    let second_labels: Vec<&str> = second.split('.').collect();
-    host_pattern_labels_can_overlap(&first_labels, &second_labels)
-}
-
-fn host_pattern_labels_can_overlap(first: &[&str], second: &[&str]) -> bool {
-    match (first.split_first(), second.split_first()) {
-        (None, None) => true,
-        (None, Some((label, rest))) if *label == "**" => {
-            host_pattern_labels_can_overlap(first, rest)
-        }
-        (Some((label, rest)), None) if *label == "**" => {
-            host_pattern_labels_can_overlap(rest, second)
-        }
-        (None, _) | (_, None) => false,
-        (Some((label, rest)), _) if *label == "**" => {
-            host_pattern_labels_can_overlap(rest, second)
-                || host_pattern_labels_can_overlap(first, &second[1..])
-        }
-        (_, Some((label, rest))) if *label == "**" => {
-            host_pattern_labels_can_overlap(first, rest)
-                || host_pattern_labels_can_overlap(&first[1..], second)
-        }
-        (Some((first_label, first_rest)), Some((second_label, second_rest))) => {
-            (*first_label == "*" || *second_label == "*" || first_label == second_label)
-                && host_pattern_labels_can_overlap(first_rest, second_rest)
-        }
-    }
+    openshell_core::host_pattern::host_patterns_overlap(first, second).unwrap_or(false)
 }
 
 fn path_patterns_can_overlap(first: &str, second: &str) -> bool {
@@ -3617,10 +3556,11 @@ mod tests {
 
     use super::{
         DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
-        ProfileDurationWkt, ProfileError, ProviderTypeProfile, is_mcp_diagnostic_field,
-        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
-        profile_duration_to_proto, profile_to_json, profile_to_yaml, profiles_to_json,
-        profiles_to_yaml, token_grant_from_proto, token_grant_to_proto, validate_profile_duration,
+        ProfileDurationWkt, ProfileError, ProviderTypeProfile, TokenGrantAudienceOverrideProfile,
+        is_mcp_diagnostic_field, normalize_profile_id, parse_profile_catalog_yamls,
+        parse_profile_json, parse_profile_yaml, profile_duration_to_proto, profile_to_json,
+        profile_to_yaml, profiles_to_json, profiles_to_yaml, token_grant_from_proto,
+        token_grant_override_matches_endpoint, token_grant_to_proto, validate_profile_duration,
         validate_profile_set,
     };
 
@@ -5589,6 +5529,65 @@ endpoints:
             diagnostics.is_empty(),
             "unexpected diagnostics: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_ambiguous_intra_label_wildcard_audience_overrides() {
+        // Both overrides score the same and both match api-api.example.com
+        // under the supervisor's host matcher.
+        let profile = parse_profile_yaml(
+            r"
+id: intra-label-token-grant
+display_name: Intra Label Token Grant
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+      audience: api://default
+      audience_overrides:
+        - host: '*-api.example.com'
+          audience: api://suffix
+        - host: 'api-*.example.com'
+          audience: api://prefix
+endpoints:
+  - host: '*.example.com'
+    port: 443
+    protocol: rest
+    access: full
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("intra-label.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.field == "credentials.token_grant.audience_overrides")
+            .unwrap_or_else(|| panic!("ambiguity should be reported: {diagnostics:?}"));
+        assert!(diagnostic.message.contains("indexes 0 and 1"));
+    }
+
+    #[test]
+    fn token_grant_override_host_matching_follows_runtime_host_patterns() {
+        let override_config = |host: &str| TokenGrantAudienceOverrideProfile {
+            host: host.to_string(),
+            port: 0,
+            path: String::new(),
+            audience: "api://override".to_string(),
+            scopes: Vec::new(),
+        };
+        assert!(token_grant_override_matches_endpoint(
+            &override_config("*-api.example.com"),
+            "tenant-api.example.com",
+            443
+        ));
+        // `**` must consume at least one label, as it does at runtime.
+        assert!(!token_grant_override_matches_endpoint(
+            &override_config("**.example.com"),
+            "example.com",
+            443
+        ));
     }
 
     #[test]

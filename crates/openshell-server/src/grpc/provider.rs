@@ -1699,36 +1699,10 @@ fn token_grant_override_matches_endpoint(
     host_matches && port_matches
 }
 
+/// Match with the same DNS-label glob semantics the supervisor uses when it
+/// selects a dynamic credential for a request.
 fn host_pattern_matches(pattern: &str, host: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let host = host.to_ascii_lowercase();
-    if pattern == host {
-        return true;
-    }
-    if !pattern.contains('*') {
-        return false;
-    }
-
-    let pattern_labels: Vec<&str> = pattern.split('.').collect();
-    let host_labels: Vec<&str> = host.split('.').collect();
-    host_pattern_labels_match(&pattern_labels, &host_labels)
-}
-
-fn host_pattern_labels_match(pattern: &[&str], host: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => host.is_empty(),
-        Some((label, rest)) if *label == "**" => {
-            host_pattern_labels_match(rest, host)
-                || (!host.is_empty() && host_pattern_labels_match(pattern, &host[1..]))
-        }
-        Some((label, rest)) if *label == "*" => {
-            !host.is_empty() && host_pattern_labels_match(rest, &host[1..])
-        }
-        Some((literal, rest)) => {
-            host.first().is_some_and(|label| label == literal)
-                && host_pattern_labels_match(rest, &host[1..])
-        }
-    }
+    openshell_core::host_pattern::host_matches(pattern, host).unwrap_or(false)
 }
 
 fn dynamic_token_grant_match_score(host: &str, path: &str) -> u32 {
@@ -1757,42 +1731,7 @@ fn count_as_u32(count: usize) -> u32 {
 }
 
 fn host_patterns_can_overlap(first: &str, second: &str) -> bool {
-    let first = first.to_ascii_lowercase();
-    let second = second.to_ascii_lowercase();
-    if !first.contains('*') {
-        return host_pattern_matches(&second, &first);
-    }
-    if !second.contains('*') {
-        return host_pattern_matches(&first, &second);
-    }
-    let first_labels: Vec<&str> = first.split('.').collect();
-    let second_labels: Vec<&str> = second.split('.').collect();
-    host_pattern_labels_can_overlap(&first_labels, &second_labels)
-}
-
-fn host_pattern_labels_can_overlap(first: &[&str], second: &[&str]) -> bool {
-    match (first.split_first(), second.split_first()) {
-        (None, None) => true,
-        (None, Some((label, rest))) if *label == "**" => {
-            host_pattern_labels_can_overlap(first, rest)
-        }
-        (Some((label, rest)), None) if *label == "**" => {
-            host_pattern_labels_can_overlap(rest, second)
-        }
-        (None, _) | (_, None) => false,
-        (Some((label, rest)), _) if *label == "**" => {
-            host_pattern_labels_can_overlap(rest, second)
-                || host_pattern_labels_can_overlap(first, &second[1..])
-        }
-        (_, Some((label, rest))) if *label == "**" => {
-            host_pattern_labels_can_overlap(first, rest)
-                || host_pattern_labels_can_overlap(&first[1..], second)
-        }
-        (Some((first_label, first_rest)), Some((second_label, second_rest))) => {
-            (*first_label == "*" || *second_label == "*" || first_label == second_label)
-                && host_pattern_labels_can_overlap(first_rest, second_rest)
-        }
-    }
+    openshell_core::host_pattern::host_patterns_overlap(first, second).unwrap_or(false)
 }
 
 fn path_patterns_can_overlap(first: &str, second: &str) -> bool {
@@ -5367,6 +5306,29 @@ mod tests {
             telemetry_provider_profile("corp-llm-prod"),
             TelemetryProviderProfile::Custom
         );
+    }
+
+    #[test]
+    fn token_grant_override_host_matching_follows_runtime_host_patterns() {
+        let override_config = |host: &str| ProviderCredentialTokenGrantAudienceOverride {
+            host: host.to_string(),
+            ..Default::default()
+        };
+        assert!(token_grant_override_matches_endpoint(
+            &override_config("*-api.example.com"),
+            "tenant-api.example.com",
+            443
+        ));
+        // `**` must consume at least one label, as it does at runtime.
+        assert!(!token_grant_override_matches_endpoint(
+            &override_config("**.example.com"),
+            "example.com",
+            443
+        ));
+        assert!(host_patterns_can_overlap(
+            "*-api.example.com",
+            "api-*.example.com"
+        ));
     }
 
     #[test]
