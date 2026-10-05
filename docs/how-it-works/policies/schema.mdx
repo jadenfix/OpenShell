@@ -210,6 +210,7 @@ network_policies:
 
 OpenShell rejects an endpoint that breaks these rules:
 
+- `port` and `ports` cannot be combined.
 - `access` and `rules` cannot be combined. `rest`, `websocket`, and `graphql`
   endpoints need one of them. `mcp` and `json-rpc` endpoints need `rules`,
   unless an MCP endpoint sets `mcp.allow_all_known_mcp_methods: true`.

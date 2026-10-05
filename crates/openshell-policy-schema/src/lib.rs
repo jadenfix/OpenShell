@@ -670,6 +670,12 @@ fn validate_policy(document: &PolicyDocument) -> Result<()> {
     for (key, rule) in &document.network_policies {
         let name = rule.effective_name(key);
         for endpoint in &rule.endpoints {
+            if endpoint.port != 0 && !endpoint.ports.is_empty() {
+                miette::bail!(
+                    "network policy '{name}': endpoint '{}': port and ports are mutually exclusive; use ports for multiple ports",
+                    endpoint.host
+                );
+            }
             if endpoint.protocol.eq_ignore_ascii_case("mcp") {
                 if let Some(config) = &endpoint.mcp {
                     validate_mcp_config(config, &format!("network policy '{name}'"))?;
@@ -1169,6 +1175,31 @@ mod tests {
             "version: 1\nnetwork_policies:\n  x:\n    endpoints:\n      - host: x\n        port: 65536\n",
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejects_port_combined_with_ports() {
+        let error = parse_policy(
+            "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: api.example.com\n        port: 443\n        ports: [8443]\n",
+        )
+        .expect_err("port and ports are mutually exclusive");
+        assert!(
+            error.to_string().contains(
+                "network policy 'api': endpoint 'api.example.com': port and ports are mutually exclusive"
+            ),
+            "{error}"
+        );
+
+        for accepted in [
+            "port: 443",
+            "ports: [443, 8443]",
+            "port: 443\n        ports: []",
+        ] {
+            let source = format!(
+                "version: 1\nnetwork_policies:\n  api:\n    endpoints:\n      - host: api.example.com\n        {accepted}\n"
+            );
+            parse_policy(&source).unwrap_or_else(|error| panic!("{accepted}: {error}"));
+        }
     }
 
     #[test]
