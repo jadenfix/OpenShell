@@ -590,35 +590,90 @@ fn load_or_create_file_key_encryption_key(path: &Path) -> CoreResult<[u8; KEY_LE
         ))
     })?;
     let key_encryption_key = random_bytes_core::<KEY_LEN>()?;
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let suffix = hex_encode(&random_bytes_core::<8>()?);
+    let temp_path = path.with_file_name(format!(".{file_name}.{suffix}.tmp"));
+    write_new_key_file(&temp_path, &key_encryption_key).map_err(|err| {
+        Error::config(format!(
+            "failed to write default credential storage key-encryption key '{}': {err}",
+            path.display()
+        ))
+    })?;
+    // Publish the fully written key with a hard link, which fails instead of
+    // replacing a key another process published first, so readers never see
+    // an empty or partially written key file.
+    let linked = fs::hard_link(&temp_path, path);
+    let _ = fs::remove_file(&temp_path);
+    let published = match linked {
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(err),
+        // Some filesystems do not support hard links; create the key file in
+        // place there, which still never replaces an existing key.
+        Err(_) => write_new_key_file(path, &key_encryption_key),
+        Ok(()) => Ok(()),
+    };
+    match published {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return load_or_create_file_key_encryption_key(path);
+        }
+        Err(err) => {
+            return Err(Error::config(format!(
+                "failed to create default credential storage key-encryption key '{}': {err}",
+                path.display()
+            )));
+        }
+    }
+    sync_parent_dir(path).map_err(|err| {
+        Error::config(format!(
+            "failed to persist default credential storage key-encryption key '{}': {err}",
+            path.display()
+        ))
+    })?;
+    openshell_core::paths::set_file_owner_only(path).map_err(|err| {
+        Error::config(format!(
+            "failed to restrict default credential storage key-encryption key '{}': {err}",
+            path.display()
+        ))
+    })?;
+    Ok(key_encryption_key)
+}
+
+/// Create `target` as a new owner-only file holding `key_encryption_key` and
+/// flush it to disk. Fails with `AlreadyExists` if `target` exists.
+fn write_new_key_file(target: &Path, key_encryption_key: &[u8; KEY_LEN]) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    match options.open(path) {
-        Ok(mut file) => {
-            if let Err(err) = file.write_all(&key_encryption_key) {
-                let _ = fs::remove_file(path);
-                return Err(Error::config(format!(
-                    "failed to write default credential storage key-encryption key '{}': {err}",
-                    path.display()
-                )));
-            }
-            openshell_core::paths::set_file_owner_only(path).map_err(|err| {
-                Error::config(format!(
-                    "failed to restrict default credential storage key-encryption key '{}': {err}",
-                    path.display()
-                ))
-            })?;
-            Ok(key_encryption_key)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            load_or_create_file_key_encryption_key(path)
-        }
-        Err(err) => Err(Error::config(format!(
-            "failed to create default credential storage key-encryption key '{}': {err}",
-            path.display()
-        ))),
+    let mut file = options.open(target)?;
+    let written = file
+        .write_all(key_encryption_key)
+        .and_then(|()| file.sync_all());
+    if written.is_err() {
+        drop(file);
+        let _ = fs::remove_file(target);
     }
+    written
+}
+
+/// Flush the directory entry for `path` so a newly created file survives a
+/// crash.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn new_handle_id() -> Result<String, Status> {
@@ -1234,6 +1289,39 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn concurrent_key_encryption_key_creation_never_exposes_partial_file() {
+        // Every caller racing to create the key file must either create it
+        // or read the complete key another caller published.
+        const CALLERS: usize = 8;
+        for _ in 0..50 {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(DEFAULT_KEY_ENCRYPTION_KEY_FILE);
+            let barrier = std::sync::Barrier::new(CALLERS);
+            let keys = std::thread::scope(|scope| {
+                let handles = (0..CALLERS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            load_or_create_file_key_encryption_key(&path)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert!(keys.iter().all(|key| *key == keys[0]));
+            assert_eq!(fs::read(&path).unwrap(), keys[0]);
+            assert_eq!(
+                fs::read_dir(tmp.path()).unwrap().count(),
+                1,
+                "only the key file should remain"
+            );
+        }
     }
 
     #[test]
