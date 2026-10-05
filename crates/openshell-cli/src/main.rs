@@ -186,8 +186,9 @@ fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<St
                 ));
             };
             if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
-                let insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
-                    .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
+                // `tls.gateway_insecure` carries `--gateway-insecure` and its
+                // `OPENSHELL_GATEWAY_INSECURE` fallback, as parsed by clap.
+                let insecure = tls.gateway_insecure;
                 // Try to refresh the token in-place using block_in_place
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
@@ -5017,6 +5018,126 @@ mod tests {
 
             assert!(error.contains("edge credentials are missing"));
             assert!(!tls.is_bearer_auth());
+        });
+    }
+
+    /// Serve an OIDC issuer over HTTPS with a self-signed certificate, so
+    /// requests only succeed when TLS verification is disabled.
+    async fn spawn_self_signed_oidc_issuer() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("https://{}", listener.local_addr().unwrap());
+
+        let served_issuer = issuer.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let issuer = served_issuer.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&request);
+                        let Some(header_end) = text.find("\r\n\r\n") else {
+                            continue;
+                        };
+                        let content_length = text[..header_end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                    let body = if request.starts_with(b"GET /.well-known/openid-configuration") {
+                        serde_json::json!({
+                            "issuer": issuer,
+                            "authorization_endpoint": format!("{issuer}/authorize"),
+                            "token_endpoint": format!("{issuer}/token"),
+                        })
+                    } else {
+                        serde_json::json!({
+                            "access_token": "refreshed-access",
+                            "token_type": "bearer",
+                            "expires_in": 3600,
+                        })
+                    }
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        issuer
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_auth_refreshes_oidc_token_with_gateway_insecure_flag() {
+        let issuer = spawn_self_signed_oidc_issuer().await;
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            temp_env::with_var_unset("OPENSHELL_GATEWAY_INSECURE", || {
+                store_gateway_metadata(
+                    "oidc-gateway",
+                    &GatewayMetadata {
+                        name: "oidc-gateway".to_string(),
+                        gateway_endpoint: "https://gw.example.com".to_string(),
+                        is_remote: true,
+                        auth_mode: Some("oidc".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                openshell_bootstrap::oidc_token::store_oidc_token(
+                    "oidc-gateway",
+                    &openshell_bootstrap::oidc_token::OidcTokenBundle {
+                        access_token: "expired-access".to_string(),
+                        refresh_token: Some("refresh-token".to_string()),
+                        expires_at: Some(1),
+                        issuer: issuer.clone(),
+                        client_id: "openshell-cli".to_string(),
+                    },
+                )
+                .unwrap();
+
+                // `--gateway-insecure` reaches apply_auth through TlsOptions;
+                // the environment variable is deliberately unset.
+                let mut tls = TlsOptions::default();
+                tls.gateway_insecure = true;
+                let error = apply_auth_with_status(&mut tls, "oidc-gateway");
+
+                assert_eq!(error, None);
+                assert_eq!(tls.oidc_token.as_deref(), Some("refreshed-access"));
+            });
         });
     }
 
