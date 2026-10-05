@@ -4882,10 +4882,19 @@ fn git_sync_files_in_repo(local_path: &Path, repo_root: &Path) -> Result<(PathBu
         Some(relative_path.to_string_lossy().into_owned())
     };
 
+    // The upload path is a filesystem path, not a pathspec: without
+    // --literal-pathspecs, characters such as `*`, `?` and `[` would select
+    // sibling paths that merely match the pattern.
     let mut command = Command::new("git");
     scrub_git_env(&mut command);
     let output = command
-        .args(["ls-files", "-co", "--exclude-standard", "-z"])
+        .args([
+            "--literal-pathspecs",
+            "ls-files",
+            "-co",
+            "--exclude-standard",
+            "-z",
+        ])
         .args(pathspec.as_deref())
         .current_dir(&repo_root)
         .output()
@@ -7905,6 +7914,35 @@ mod tests {
                 super::SandboxUploadPlan::Regular,
             );
         }
+    }
+
+    #[test]
+    fn sandbox_upload_plan_treats_paths_literally_not_as_pathspecs() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path();
+        init_git_repo(repo);
+        fs::create_dir(repo.join("data[12]")).expect("create bracketed directory");
+        fs::write(repo.join("data[12]/keep.txt"), "keep").expect("write bracketed file");
+        fs::create_dir(repo.join("data1")).expect("create sibling directory");
+        fs::write(repo.join("data1/other.txt"), "other").expect("write sibling file");
+        fs::write(repo.join("data2"), "other").expect("write sibling file");
+        fs::write(repo.join("file*.txt"), "star").expect("write starred file");
+        fs::write(repo.join("file-other.txt"), "other").expect("write sibling file");
+
+        assert_eq!(
+            sandbox_upload_plan(&repo.join("data[12]"), true).expect("bracketed directory"),
+            super::SandboxUploadPlan::GitAware {
+                base_dir: fs::canonicalize(repo.join("data[12]")).expect("canonical path"),
+                files: vec!["keep.txt".to_string()],
+            },
+        );
+        assert_eq!(
+            sandbox_upload_plan(&repo.join("file*.txt"), true).expect("starred file"),
+            super::SandboxUploadPlan::GitAware {
+                base_dir: fs::canonicalize(repo).expect("canonical path"),
+                files: vec!["file*.txt".to_string()],
+            },
+        );
     }
 
     #[test]
