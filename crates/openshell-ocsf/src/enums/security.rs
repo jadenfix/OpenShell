@@ -77,18 +77,16 @@ impl ConfidenceId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum RiskLevelId {
-    /// 0 — Unknown
-    Unknown = 0,
-    /// 1 — Info
-    Info = 1,
-    /// 2 — Low
-    Low = 2,
-    /// 3 — Medium
-    Medium = 3,
-    /// 4 — High
-    High = 4,
-    /// 5 — Critical
-    Critical = 5,
+    /// 0 — Info
+    Info = 0,
+    /// 1 — Low
+    Low = 1,
+    /// 2 — Medium
+    Medium = 2,
+    /// 3 — High
+    High = 3,
+    /// 4 — Critical
+    Critical = 4,
     /// 99 — Other
     Other = 99,
 }
@@ -97,7 +95,6 @@ impl RiskLevelId {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Unknown => "Unknown",
             Self::Info => "Info",
             Self::Low => "Low",
             Self::Medium => "Medium",
@@ -135,12 +132,36 @@ mod tests {
 
     #[test]
     fn test_risk_level_labels() {
-        assert_eq!(RiskLevelId::Unknown.label(), "Unknown");
         assert_eq!(RiskLevelId::Info.label(), "Info");
         assert_eq!(RiskLevelId::Low.label(), "Low");
         assert_eq!(RiskLevelId::Medium.label(), "Medium");
         assert_eq!(RiskLevelId::High.label(), "High");
         assert_eq!(RiskLevelId::Critical.label(), "Critical");
+    }
+
+    #[test]
+    fn test_risk_level_ids_match_vendored_schema() {
+        let schema = crate::validation::load_class_schema("detection_finding");
+        let enum_map = schema["attributes"]["risk_level_id"]["enum"]
+            .as_object()
+            .expect("risk_level_id enum in detection_finding schema");
+        let variants = [
+            RiskLevelId::Info,
+            RiskLevelId::Low,
+            RiskLevelId::Medium,
+            RiskLevelId::High,
+            RiskLevelId::Critical,
+            RiskLevelId::Other,
+        ];
+        assert_eq!(variants.len(), enum_map.len());
+        for risk in variants {
+            let key = risk.as_u8().to_string();
+            let caption = enum_map
+                .get(&key)
+                .and_then(|def| def["caption"].as_str())
+                .unwrap_or_else(|| panic!("risk_level_id {key} missing from schema"));
+            assert_eq!(caption, risk.label(), "risk_level_id {key}");
+        }
     }
 
     #[test]
@@ -155,6 +176,6 @@ mod tests {
 
         let risk = RiskLevelId::High;
         let json = serde_json::to_value(risk).unwrap();
-        assert_eq!(json, serde_json::json!(4));
+        assert_eq!(json, serde_json::json!(3));
     }
 }
