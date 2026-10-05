@@ -663,11 +663,11 @@ enum Commands {
     ///   `openshell ssh-proxy --gateway <url> --sandbox <name> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>`
+    ///   `openshell ssh-proxy --gateway-name <name> --name <sandbox-name>`
     #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
-        /// Required in token mode. In name mode, can be a gateway name.
+        /// Required in token mode.
         #[arg(long, short = 'g')]
         gateway: Option<String>,
 
@@ -679,7 +679,8 @@ enum Commands {
         #[arg(long)]
         token: Option<String>,
 
-        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway.
+        /// Gateway endpoint URL. Used in name mode instead of, or to override
+        /// the endpoint stored for, --gateway-name.
         #[arg(long)]
         server: Option<String>,
 
