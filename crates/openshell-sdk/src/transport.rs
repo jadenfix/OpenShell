@@ -201,6 +201,20 @@ pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
         .with_no_client_auth())
 }
 
+/// Convert a `hyper::Uri` host into a rustls server name.
+///
+/// `Uri::host` keeps the brackets around IPv6 literals (`[::1]`), which
+/// `ServerName` rejects, so strip them first.
+fn tls_server_name_for_uri_host(
+    host: &str,
+) -> std::result::Result<ServerName<'static>, rustls::pki_types::InvalidDnsNameError> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    ServerName::try_from(host.to_string())
+}
+
 /// `tower::Service` connector that performs TLS using the supplied rustls
 /// connector, bypassing tonic's built-in TLS layering.
 ///
@@ -234,9 +248,38 @@ impl tower::Service<hyper::Uri> for InsecureTlsConnector {
             let addr = format!("{host}:{port}");
             let tcp = tokio::net::TcpStream::connect(addr).await?;
             set_tcp_nodelay_best_effort(&tcp);
-            let server_name = ServerName::try_from(host)?;
+            let server_name = tls_server_name_for_uri_host(&host)?;
             let tls_stream = tls_connector.connect(server_name, tcp).await?;
             Ok(hyper_util::rt::TokioIo::new(tls_stream))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tls_server_name_for_uri_host;
+    use rustls::pki_types::ServerName;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn insecure_connector_server_name_accepts_bracketed_ipv6_uri_host() {
+        let uri: hyper::Uri = "http://[::1]:17670".parse().unwrap();
+        assert_eq!(uri.host(), Some("[::1]"));
+        assert_eq!(
+            tls_server_name_for_uri_host(uri.host().unwrap()).unwrap(),
+            ServerName::IpAddress(Ipv6Addr::LOCALHOST.into())
+        );
+    }
+
+    #[test]
+    fn insecure_connector_server_name_preserves_dns_and_ipv4_hosts() {
+        assert_eq!(
+            tls_server_name_for_uri_host("gw.example.com").unwrap(),
+            ServerName::try_from("gw.example.com").unwrap()
+        );
+        assert_eq!(
+            tls_server_name_for_uri_host("127.0.0.1").unwrap(),
+            ServerName::IpAddress(Ipv4Addr::LOCALHOST.into())
+        );
     }
 }
