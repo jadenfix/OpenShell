@@ -251,6 +251,21 @@ fn resolve_sandbox_name(name: Option<String>, gateway: &str, workspace: &str) ->
     Ok(last)
 }
 
+/// Record `name` as the last-used sandbox after an interactive session and
+/// return the session's exit code when the CLI must exit with it.
+///
+/// The sandbox is recorded even when the remote command exits non-zero, so
+/// callers must run this before `std::process::exit`.
+fn finish_sandbox_session(
+    gateway: &str,
+    workspace: &str,
+    name: &str,
+    exit_code: i32,
+) -> Option<i32> {
+    let _ = save_last_sandbox(gateway, workspace, name);
+    (exit_code != 0).then_some(exit_code)
+}
+
 // Custom root help stays hand-authored so commands can be grouped into product
 // areas without relying on clap's default subcommand listing. User-facing
 // commands remain visible so shell completion can suggest them at the root.
@@ -3588,7 +3603,7 @@ async fn run_async() -> Result<()> {
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                            if let Some(editor) = editor.map(Into::into) {
+                            let exit_code = if let Some(editor) = editor.map(Into::into) {
                                 run::sandbox_connect_editor(
                                     endpoint,
                                     &ctx.name,
@@ -3598,15 +3613,15 @@ async fn run_async() -> Result<()> {
                                     &cli.workspace,
                                 )
                                 .await?;
+                                0
                             } else {
-                                let exit_code =
-                                    run::sandbox_connect(endpoint, &name, &tls, &cli.workspace)
-                                        .await?;
-                                if exit_code != 0 {
-                                    std::process::exit(exit_code);
-                                }
+                                run::sandbox_connect(endpoint, &name, &tls, &cli.workspace).await?
+                            };
+                            if let Some(code) =
+                                finish_sandbox_session(&ctx.name, &cli.workspace, &name, exit_code)
+                            {
+                                std::process::exit(code);
                             }
-                            let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
                         }
                         SandboxCommands::Exec {
                             sandbox,
@@ -3643,9 +3658,10 @@ async fn run_async() -> Result<()> {
                                 &cli.workspace,
                             )
                             .await?;
-                            let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
-                            if exit_code != 0 {
-                                std::process::exit(exit_code);
+                            if let Some(code) =
+                                finish_sandbox_session(&ctx.name, &cli.workspace, &name, exit_code)
+                            {
+                                std::process::exit(code);
                             }
                         }
                         SandboxCommands::SshConfig { name } => {
@@ -4909,6 +4925,30 @@ mod tests {
             save_last_sandbox("test-gateway", "default", "remembered-sb").unwrap();
             let result = resolve_sandbox_name(None, "test-gateway", "default");
             assert_eq!(result.unwrap(), "remembered-sb");
+        });
+    }
+
+    #[test]
+    fn finish_sandbox_session_records_last_sandbox_on_non_zero_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            assert_eq!(
+                finish_sandbox_session("test-gateway", "default", "failed-sb", 130),
+                Some(130)
+            );
+            assert_eq!(
+                load_last_sandbox("test-gateway", "default").as_deref(),
+                Some("failed-sb")
+            );
+
+            assert_eq!(
+                finish_sandbox_session("test-gateway", "default", "ok-sb", 0),
+                None
+            );
+            assert_eq!(
+                load_last_sandbox("test-gateway", "default").as_deref(),
+                Some("ok-sb")
+            );
         });
     }
 
