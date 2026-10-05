@@ -376,7 +376,8 @@ async fn run_session_loop(config: SessionConfig) {
                 break;
             }
             Err(e) => {
-                config.ready_tx.send_replace(false);
+                // `ready_tx` is only set once the gateway accepted the session.
+                let session_was_accepted = config.ready_tx.send_replace(false);
                 let event = session_failed_event(
                     openshell_ocsf::ctx::ctx(),
                     &config.endpoint,
@@ -384,11 +385,24 @@ async fn run_session_loop(config: SessionConfig) {
                     &e.to_string(),
                 );
                 ocsf_emit!(event);
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                tokio::time::sleep(next_reconnect_delay(&mut backoff, session_was_accepted)).await;
             }
         }
     }
+}
+
+/// Return the delay before the next reconnect attempt and advance `backoff`.
+///
+/// A session the gateway accepted proves the endpoint is reachable again, so
+/// the backoff restarts from [`INITIAL_BACKOFF`] instead of compounding across
+/// unrelated disconnects over the life of the sandbox.
+fn next_reconnect_delay(backoff: &mut Duration, session_was_accepted: bool) -> Duration {
+    if session_was_accepted {
+        *backoff = INITIAL_BACKOFF;
+    }
+    let delay = *backoff;
+    *backoff = (*backoff * 2).min(MAX_BACKOFF);
+    delay
 }
 
 async fn run_single_session(
@@ -1002,6 +1016,27 @@ mod ocsf_event_tests {
             proxy_port: 3128,
             origin: openshell_ocsf::EventOrigin::Supervisor,
         }
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_until_a_session_is_accepted() {
+        let mut backoff = INITIAL_BACKOFF;
+        assert_eq!(next_reconnect_delay(&mut backoff, false), INITIAL_BACKOFF);
+        assert_eq!(
+            next_reconnect_delay(&mut backoff, false),
+            INITIAL_BACKOFF * 2
+        );
+        for _ in 0..10 {
+            next_reconnect_delay(&mut backoff, false);
+        }
+        assert_eq!(next_reconnect_delay(&mut backoff, false), MAX_BACKOFF);
+
+        // A dropped session that had been accepted reconnects promptly.
+        assert_eq!(next_reconnect_delay(&mut backoff, true), INITIAL_BACKOFF);
+        assert_eq!(
+            next_reconnect_delay(&mut backoff, false),
+            INITIAL_BACKOFF * 2
+        );
     }
 
     #[test]
