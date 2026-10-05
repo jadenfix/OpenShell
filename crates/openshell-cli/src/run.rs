@@ -1087,8 +1087,13 @@ pub async fn sandbox_create(
                     }
                 };
                 transfer.wrap_err_with(|| {
+                    let earlier = if idx > 0 {
+                        "; earlier uploads may have completed"
+                    } else {
+                        ""
+                    };
                     format!(
-                        "Sandbox '{sandbox_name}' was created and still exists; earlier uploads may have completed.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
+                        "Sandbox '{sandbox_name}' was created and still exists{earlier}.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
                     )
                 })?;
                 eprintln!("  {} Files uploaded", "\u{2713}".green().bold());

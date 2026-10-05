@@ -3279,6 +3279,54 @@ async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
     );
 }
 
+#[tokio::test]
+async fn sandbox_create_upload_no_git_ignore_provisions_an_ignored_source() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("runs")).unwrap();
+    fs::write(source.path().join("runs/marker.txt"), "dummy content").unwrap();
+    fs::write(source.path().join(".gitignore"), "runs/\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(source.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let path = source.path().join("runs");
+    let args = [
+        "--detach",
+        "--upload",
+        path.to_str().unwrap(),
+        "--no-git-ignore",
+    ];
+    let result = run_cli_sandbox_create(&server, "upload-unfiltered", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    // The fake SSH transport fails; the unfiltered upload must still reach it.
+    assert!(!result.status.success(), "{stderr}");
+    assert!(!stderr.contains("no sandbox was created"), "{stderr}");
+    assert!(
+        stderr.contains("Sandbox 'upload-unfiltered' was created and still exists."),
+        "{stderr}",
+    );
+    assert!(!stderr.contains("earlier uploads"), "{stderr}");
+    assert_eq!(create_requests(&server).await.len(), 1);
+    assert!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst)
+            > 0,
+        "an intentional unfiltered upload must reach the SSH transport",
+    );
+}
+
 async fn run_cli_sandbox_template_create(
     server: &TestServer,
     name: &str,
