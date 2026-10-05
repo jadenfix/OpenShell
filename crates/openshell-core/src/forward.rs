@@ -667,6 +667,11 @@ impl ForwardSpec {
     /// - `"8080"` → `ForwardSpec { bind_addr: "127.0.0.1", port: 8080 }`
     /// - `"0.0.0.0:8080"` → `ForwardSpec { bind_addr: "0.0.0.0", port: 8080 }`
     /// - `"::1:8080"` → `ForwardSpec { bind_addr: "::1", port: 8080 }`
+    /// - `"[::1]:8080"` → `ForwardSpec { bind_addr: "::1", port: 8080 }`
+    ///
+    /// A bind address that is bracketed or contains `:` must be an IPv6
+    /// literal, so a port-less IPv6 address such as `"::1"` is rejected
+    /// instead of being split into a bogus address and port.
     pub fn parse(s: &str) -> Result<Self> {
         // Split on the last ':' to handle IPv6 addresses like "::1:8080".
         if let Some(pos) = s.rfind(':') {
@@ -676,8 +681,13 @@ impl ForwardSpec {
                 if port == 0 {
                     return Err(miette::miette!("port must be between 1 and 65535"));
                 }
+                let bind_addr = normalize_bind_addr(addr).ok_or_else(|| {
+                    miette::miette!(
+                        "invalid forward spec '{s}': bind address '{addr}' is not a valid IPv6 address"
+                    )
+                })?;
                 return Ok(Self {
-                    bind_addr: addr.to_string(),
+                    bind_addr: bind_addr.to_string(),
                     port,
                 });
             }
@@ -718,6 +728,22 @@ impl ForwardSpec {
         };
         format!("{}/", format_gateway_url("http", host, self.port))
     }
+}
+
+/// Strip the brackets from a bracketed IPv6 bind address (`[::1]` → `::1`).
+///
+/// Returns `None` when the address is bracketed or contains `:` but is not an
+/// IPv6 literal. Other addresses (IPv4 literals, hostnames) are returned as-is.
+fn normalize_bind_addr(addr: &str) -> Option<&str> {
+    let bracketed = addr
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'));
+    let candidate = bracketed.unwrap_or(addr);
+    let must_be_ipv6 = bracketed.is_some() || addr.contains([':', '[', ']']);
+    if must_be_ipv6 && candidate.parse::<std::net::Ipv6Addr>().is_err() {
+        return None;
+    }
+    Some(candidate)
 }
 
 impl std::fmt::Display for ForwardSpec {
@@ -1541,6 +1567,57 @@ mod tests {
         let spec = ForwardSpec::parse("::1:8080").unwrap();
         assert_eq!(spec.bind_addr, "::1");
         assert_eq!(spec.port, 8080);
+    }
+
+    #[test]
+    fn forward_spec_parse_bracketed_ipv6_and_port() {
+        let spec = ForwardSpec::parse("[::1]:8080").unwrap();
+        assert_eq!(spec.bind_addr, "::1");
+        assert_eq!(spec.port, 8080);
+        assert_eq!(spec.ssh_forward_arg(), "[::1]:8080:127.0.0.1:8080");
+        assert_eq!(spec.access_url(), "http://[::1]:8080/");
+
+        let spec = ForwardSpec::parse("[::]:8080").unwrap();
+        assert_eq!(spec.bind_addr, "::");
+        assert_eq!(spec.ssh_forward_arg(), "[::]:8080:127.0.0.1:8080");
+        assert_eq!(spec.access_url(), "http://localhost:8080/");
+    }
+
+    #[test]
+    fn forward_spec_parse_rejects_ipv6_without_port() {
+        assert!(ForwardSpec::parse("::1").is_err());
+        assert!(ForwardSpec::parse("[::1]").is_err());
+        assert!(ForwardSpec::parse("[::1]:").is_err());
+        assert!(ForwardSpec::parse("[localhost]:8080").is_err());
+    }
+
+    #[test]
+    fn check_port_available_accepts_bracketed_ipv6_spec() {
+        // A bracketed bind address must reach the bind check as a plain IPv6
+        // literal; otherwise every port is reported as already in use. Retry
+        // with fresh OS-assigned ports in case another process claims one.
+        let mut last_error = None;
+        for _ in 0..20 {
+            let Ok(probe) = TcpListener::bind("[::1]:0") else {
+                return; // IPv6 loopback not available, skip
+            };
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let spec = ForwardSpec::parse(&format!("[::1]:{port}")).unwrap();
+            match check_port_available(&spec) {
+                Ok(()) => return,
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+
+        panic!(
+            "expected an OS-assigned IPv6 port to be available; last error: {}",
+            last_error.unwrap_or_else(|| "none".to_string())
+        );
     }
 
     #[test]
