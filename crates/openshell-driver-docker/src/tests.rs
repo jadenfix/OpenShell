@@ -3195,6 +3195,56 @@ fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
     assert_eq!(status.conditions[0].message, "Docker container is starting");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_waits_for_cancelled_provisioning_task_before_cleanup() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let driver = test_driver_with_config(runtime_config());
+    let sandbox = test_sandbox();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    // Simulate provisioning that is mid-poll (for example, issuing a Docker
+    // create request) when delete arrives: abort only takes effect once the
+    // current poll returns.
+    let task = tokio::spawn({
+        let started = started.clone();
+        let flag = DropFlag(dropped.clone());
+        async move {
+            let _flag = flag;
+            started.notify_one();
+            std::thread::sleep(Duration::from_millis(500));
+            futures::future::pending::<()>().await;
+        }
+    });
+    started.notified().await;
+    driver.pending.lock().await.insert(
+        sandbox.id.clone(),
+        PendingSandboxRecord {
+            sandbox: sandbox.clone(),
+            task: Some(task),
+        },
+    );
+
+    // The test Docker client is unreachable, so cleanup itself may fail; the
+    // provisioning task must be gone before delete touches Docker either way.
+    let _ = driver
+        .delete_sandbox_inner(&sandbox.id, &sandbox.name)
+        .await;
+
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "delete must wait for the cancelled provisioning task to finish"
+    );
+    assert!(driver.pending.lock().await.is_empty());
+}
+
 #[test]
 fn pending_lookup_is_id_authoritative_and_rejects_ambiguous_names() {
     let mut alpha = test_sandbox();

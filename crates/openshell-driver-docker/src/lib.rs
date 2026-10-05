@@ -2166,13 +2166,15 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
-        let pending = self
+        let mut pending = self
             .remove_pending_sandbox(sandbox_id, sandbox_name)
             .await?;
-        if let Some(record) = pending.as_ref()
-            && let Some(task) = record.task.as_ref()
-        {
+        // Wait for cancelled provisioning to unwind before cleanup. Otherwise
+        // an in-flight supervisor container create can finish after the
+        // auxiliary containers below were removed and leak that container.
+        if let Some(task) = pending.as_mut().and_then(|record| record.task.take()) {
             task.abort();
+            let _ = task.await;
         }
         if let Some(record) = pending.as_ref() {
             self.stop_control_process(&record.sandbox.id).await;
