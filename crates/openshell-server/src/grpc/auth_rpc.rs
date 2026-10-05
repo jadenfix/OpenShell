@@ -234,7 +234,7 @@ pub async fn handle_refresh_sandbox_token(
         crate::auth::sandbox_session::RefreshAuthorization::Replay(identity) => (identity, false),
     };
     let authentication =
-        session_authority.mint_persisted_launch(&sandbox.sandbox_id, &successor)?;
+        session_authority.mint_refresh_successor(&sandbox.sandbox_id, &successor)?;
     let sandbox_record = ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
     let extension_credentials = if requested_extension_services.is_empty() {
         Vec::new()
@@ -889,6 +889,64 @@ mod tests {
             .await
             .expect_err("obsolete runtime token must not reach provider access");
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn issue_after_an_expired_refresh_returns_an_unexpired_token() {
+        use crate::auth::principal::SandboxIdentitySource;
+        use crate::auth::sandbox_session::{PersistedSandboxIdentity, RefreshRequestHash};
+
+        // The supervisor last refreshed two session TTLs ago, so every token
+        // derived from that refresh has expired.
+        let state = state_with_issuer().await;
+        let refreshed_at = current_unix_seconds() - 2 * 3600;
+        let sandbox = state
+            .store
+            .get_message::<Sandbox>("sandbox-a")
+            .await
+            .expect("load sandbox")
+            .expect("sandbox");
+        let successor =
+            PersistedSandboxIdentity::read(&sandbox.metadata.expect("metadata").annotations)
+                .expect("persisted identity")
+                .next_gateway_token(
+                    RefreshRequestHash::from_extension_services(&[]),
+                    refreshed_at,
+                    30,
+                );
+        state
+            .store
+            .update_message_cas::<Sandbox, _>("sandbox-a", 0, move |sandbox| {
+                successor.write(&mut sandbox.metadata.as_mut().expect("metadata").annotations);
+            })
+            .await
+            .expect("persist old refresh");
+
+        let mut req = Request::new(IssueSandboxTokenRequest {});
+        req.extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "sandbox-a".to_string(),
+                source: SandboxIdentitySource::ComputeDriver {
+                    driver_name: "kubernetes".to_string(),
+                    runtime_identity: "test-runtime".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        let resp = handle_issue_sandbox_token(&state, req)
+            .await
+            .expect("issue OK")
+            .into_inner();
+        let expires_at = resp.expiration_time.expect("expiring token").seconds;
+        assert!(
+            expires_at > current_unix_seconds(),
+            "a re-issued gateway token must not already be expired (expires at {expires_at})"
+        );
+        state
+            .sandbox_session_jwt_authority
+            .as_ref()
+            .expect("session authority")
+            .verify_gateway_token(&resp.token)
+            .expect("re-issued token must verify");
     }
 
     #[tokio::test]

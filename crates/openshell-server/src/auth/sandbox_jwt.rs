@@ -151,8 +151,33 @@ impl SandboxSessionJwtAuthority {
         })
     }
 
+    /// Mint fresh credentials for the persisted gateway token lineage.
+    ///
+    /// The tokens are issued now, so callers that re-mint long after the
+    /// last refresh (bootstrap re-issue, launch retries) never receive
+    /// already-expired credentials.
     #[allow(clippy::result_large_err)]
     pub fn mint_persisted_launch(
+        &self,
+        sandbox_id: &str,
+        identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        self.mint_launch_with_metadata(
+            sandbox_id,
+            identity.runtime_generation.clone(),
+            identity.auth_epoch,
+            identity.gateway_token_id,
+            None,
+        )
+    }
+
+    /// Mint the credentials for a persisted refresh successor.
+    ///
+    /// The issue time and token IDs come from the recorded refresh, so a
+    /// retried refresh within the replay window returns the same tokens as
+    /// the original response.
+    #[allow(clippy::result_large_err)]
+    pub fn mint_refresh_successor(
         &self,
         sandbox_id: &str,
         identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
