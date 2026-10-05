@@ -43,8 +43,8 @@ impl<'a> NetworkActivityBuilder<'a, MissingNetworkEndpoint> {
     /// A Network Activity must include a source or destination endpoint before
     /// it can be built.
     ///
-    /// ```compile_fail
-    /// use openshell_ocsf::{EventContext, NetworkActivityBuilder};
+    /// ```
+    /// use openshell_ocsf::{Endpoint, EventContext, EventOrigin, NetworkActivityBuilder};
     ///
     /// let ctx = EventContext {
     ///     sandbox_id: String::new(),
@@ -54,6 +54,27 @@ impl<'a> NetworkActivityBuilder<'a, MissingNetworkEndpoint> {
     ///     product_version: String::new(),
     ///     proxy_ip: "127.0.0.1".parse().unwrap(),
     ///     proxy_port: 3128,
+    ///     origin: EventOrigin::Supervisor,
+    /// };
+    /// NetworkActivityBuilder::new(&ctx)
+    ///     .dst_endpoint(Endpoint::from_ip_str("10.0.0.1", 443))
+    ///     .build();
+    /// ```
+    ///
+    /// Without one, `build` is not available:
+    ///
+    /// ```compile_fail
+    /// use openshell_ocsf::{EventContext, EventOrigin, NetworkActivityBuilder};
+    ///
+    /// let ctx = EventContext {
+    ///     sandbox_id: String::new(),
+    ///     sandbox_name: String::new(),
+    ///     container_image: String::new(),
+    ///     hostname: String::new(),
+    ///     product_version: String::new(),
+    ///     proxy_ip: "127.0.0.1".parse().unwrap(),
+    ///     proxy_port: 3128,
+    ///     origin: EventOrigin::Supervisor,
     /// };
     /// NetworkActivityBuilder::new(&ctx).build();
     /// ```

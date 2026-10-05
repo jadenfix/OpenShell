@@ -41,8 +41,8 @@ impl<'a> HttpActivityBuilder<'a, MissingHttpContext> {
     /// An HTTP Activity must include an HTTP request or response before it can
     /// be built.
     ///
-    /// ```compile_fail
-    /// use openshell_ocsf::{EventContext, HttpActivityBuilder};
+    /// ```
+    /// use openshell_ocsf::{EventContext, EventOrigin, HttpActivityBuilder, HttpRequest, Url};
     ///
     /// let ctx = EventContext {
     ///     sandbox_id: String::new(),
@@ -52,6 +52,27 @@ impl<'a> HttpActivityBuilder<'a, MissingHttpContext> {
     ///     product_version: String::new(),
     ///     proxy_ip: "127.0.0.1".parse().unwrap(),
     ///     proxy_port: 3128,
+    ///     origin: EventOrigin::Supervisor,
+    /// };
+    /// HttpActivityBuilder::new(&ctx)
+    ///     .http_request(HttpRequest::new("GET", Url::new("https", "example.com", "/", 443)))
+    ///     .build();
+    /// ```
+    ///
+    /// Without one, `build` is not available:
+    ///
+    /// ```compile_fail
+    /// use openshell_ocsf::{EventContext, EventOrigin, HttpActivityBuilder};
+    ///
+    /// let ctx = EventContext {
+    ///     sandbox_id: String::new(),
+    ///     sandbox_name: String::new(),
+    ///     container_image: String::new(),
+    ///     hostname: String::new(),
+    ///     product_version: String::new(),
+    ///     proxy_ip: "127.0.0.1".parse().unwrap(),
+    ///     proxy_port: 3128,
+    ///     origin: EventOrigin::Supervisor,
     /// };
     /// HttpActivityBuilder::new(&ctx).build();
     /// ```
