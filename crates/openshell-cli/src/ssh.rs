@@ -1798,7 +1798,7 @@ async fn sandbox_sync_down_file(
     dest: &str,
 ) -> Result<()> {
     let (parent, basename) = split_sandbox_path(sandbox_path);
-    let dest_exists_as_dir = fs::symlink_metadata(Path::new(dest)).is_ok_and(|m| m.is_dir());
+    let dest_exists_as_dir = local_path_is_existing_dir(Path::new(dest));
     let final_path = resolve_file_download_target(dest, basename, dest_exists_as_dir);
 
     let staging_parent = final_path
@@ -1873,9 +1873,25 @@ async fn sandbox_sync_down_directory(
     dest: &str,
 ) -> Result<()> {
     let dest_path = Path::new(dest);
-    if let Ok(existing) = fs::symlink_metadata(dest_path)
-        && !existing.is_dir()
-    {
+    prepare_directory_download_destination(sandbox_path, dest_path)?;
+
+    let tar_cmd = format!("tar cf - -C {path} .", path = shell_escape(sandbox_path));
+    stream_sandbox_tar(session, tar_cmd, dest_path).await
+}
+
+/// Whether a host-side download destination already exists as a directory.
+///
+/// Follows symlinks: a destination that is a symlink to a directory receives
+/// the download inside the linked directory, as with `cp`, instead of having
+/// the link replaced.
+fn local_path_is_existing_dir(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// Make sure a host-side directory download destination exists as a
+/// directory, refusing to extract over anything else.
+fn prepare_directory_download_destination(sandbox_path: &str, dest_path: &Path) -> Result<()> {
+    if fs::symlink_metadata(dest_path).is_ok() && !local_path_is_existing_dir(dest_path) {
         return Err(miette::miette!(
             "cannot extract directory '{sandbox_path}' over non-directory destination '{}'",
             dest_path.display()
@@ -1888,10 +1904,7 @@ async fn sandbox_sync_down_directory(
                 "failed to create local destination directory '{}'",
                 dest_path.display()
             )
-        })?;
-
-    let tar_cmd = format!("tar cf - -C {path} .", path = shell_escape(sandbox_path));
-    stream_sandbox_tar(session, tar_cmd, dest_path).await
+        })
 }
 
 /// Run the SSH proxy, connecting stdin/stdout to the gateway.
@@ -2949,6 +2962,80 @@ mod tests {
         let meta = fs::symlink_metadata(&final_path).expect("stat final");
         assert!(meta.is_file());
         assert_eq!(fs::read(&final_path).expect("read final"), b"trust me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_full_pipeline_places_inside_symlinked_directory_destination() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let archive = build_single_file_archive("hello.txt", b"trust me");
+
+        let real_dir = workdir.path().join("real");
+        fs::create_dir(&real_dir).expect("create real dir");
+        let link = workdir.path().join("out");
+        std::os::unix::fs::symlink(&real_dir, &link).expect("create dir symlink");
+        let dest_str = link.to_str().unwrap();
+
+        let final_path =
+            resolve_file_download_target(dest_str, "hello.txt", local_path_is_existing_dir(&link));
+        assert_eq!(final_path, link.join("hello.txt"));
+
+        let staging = tempfile::TempDir::new_in(&link).expect("staging dir");
+        unpack_into(&archive, staging.path());
+        place_downloaded_file(staging.path(), "hello.txt", &final_path).expect("place");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("stat link")
+                .file_type()
+                .is_symlink(),
+            "destination symlink must be preserved"
+        );
+        assert_eq!(
+            fs::read(real_dir.join("hello.txt")).expect("read final"),
+            b"trust me"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_download_accepts_symlinked_directory_destination() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let real_dir = workdir.path().join("real");
+        fs::create_dir(&real_dir).expect("create real dir");
+        let link = workdir.path().join("out");
+        std::os::unix::fs::symlink(&real_dir, &link).expect("create dir symlink");
+
+        prepare_directory_download_destination("/sandbox/dir", &link)
+            .expect("symlinked directory destination should be accepted");
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("stat link")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_download_rejects_non_directory_destinations() {
+        let workdir = tempfile::tempdir().expect("create workdir");
+        let file = workdir.path().join("file.txt");
+        fs::write(&file, "x").expect("write file");
+        let dangling = workdir.path().join("dangling");
+        std::os::unix::fs::symlink(workdir.path().join("missing"), &dangling)
+            .expect("create dangling symlink");
+        let file_link = workdir.path().join("file-link");
+        std::os::unix::fs::symlink(&file, &file_link).expect("create file symlink");
+
+        for dest in [&file, &dangling, &file_link] {
+            let err = prepare_directory_download_destination("/sandbox/dir", dest)
+                .expect_err("non-directory destination must be refused");
+            assert!(
+                format!("{err}").contains("over non-directory destination"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
