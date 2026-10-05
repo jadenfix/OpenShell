@@ -20,6 +20,7 @@ use openshell_ocsf::{
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -533,12 +534,17 @@ where
         client_write.flush().await.into_diagnostic()?;
     }
 
-    let client_to_server = relay_client_to_server(
+    // Set once the client's Close frame has been relayed. In the RFC 6455
+    // closing handshake the server closes TCP first, so upstream EOF after a
+    // relayed client Close is a normal end rather than an upstream disconnect.
+    let client_close_relayed = AtomicBool::new(false);
+    let client_to_server = relay_client_to_server_tracking_close(
         &mut client_read,
         &mut upstream_write,
         host,
         port,
         &mut options,
+        &client_close_relayed,
     );
     let server_to_client = async {
         let mut buf = vec![0u8; COPY_BUF_SIZE];
@@ -568,9 +574,11 @@ where
                 )
             })?;
         }
-        Ok::<_, WebSocketTermination>(
-            openshell_core::proto::MiddlewareSessionEndReason::UpstreamDisconnect,
-        )
+        Ok::<_, WebSocketTermination>(if client_close_relayed.load(Ordering::Acquire) {
+            openshell_core::proto::MiddlewareSessionEndReason::Normal
+        } else {
+            openshell_core::proto::MiddlewareSessionEndReason::UpstreamDisconnect
+        })
     };
 
     let result = tokio::select! {
@@ -643,12 +651,36 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
     ));
 }
 
+#[cfg(test)]
 async fn relay_client_to_server<R, W>(
     reader: &mut R,
     writer: &mut W,
     host: &str,
     port: u16,
     options: &mut RelayOptions<'_>,
+) -> WebSocketRelayResult<openshell_core::proto::MiddlewareSessionEndReason>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    relay_client_to_server_tracking_close(
+        reader,
+        writer,
+        host,
+        port,
+        options,
+        &AtomicBool::new(false),
+    )
+    .await
+}
+
+async fn relay_client_to_server_tracking_close<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    host: &str,
+    port: u16,
+    options: &mut RelayOptions<'_>,
+    close_relayed: &AtomicBool,
 ) -> WebSocketRelayResult<openshell_core::proto::MiddlewareSessionEndReason>
 where
     R: AsyncRead + Unpin,
@@ -898,6 +930,7 @@ where
                 control_result.map_err(WebSocketTermination::from)?;
                 if frame.opcode == OPCODE_CLOSE {
                     close_seen = true;
+                    close_relayed.store(true, Ordering::Release);
                 }
             }
             _ => unreachable!("validated opcode"),
@@ -4141,6 +4174,89 @@ network_policies:
         assert!(
             observed.try_recv().is_err(),
             "upstream EOF must produce exactly one session end"
+        );
+
+        drop(client_app);
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+            .await
+            .expect("middleware server shuts down")
+            .expect("join middleware server")
+            .expect("middleware server");
+    }
+
+    #[tokio::test]
+    async fn clean_close_handshake_reports_normal_session_end() {
+        let (mut session, mut observed, shutdown_tx, server_task) =
+            recording_middleware_session("wss").await;
+        assert!(session.start("").await.allowed);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
+                .await
+                .expect("middleware observes session start"),
+            Some(ObservedWebSocketRequest::SessionStart)
+        ));
+
+        let (mut client_app, mut relay_client) = tokio::io::duplex(4096);
+        let (mut relay_upstream, mut upstream_app) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(async move {
+            relay_with_options(
+                &mut relay_client,
+                &mut relay_upstream,
+                Vec::new(),
+                "api.openai.com",
+                443,
+                RelayOptions {
+                    policy_name: "rest-api",
+                    assembly_budget: WebSocketAssemblyBudget::default(),
+                    resolver: None,
+                    generation_guard: None,
+                    provider_credentials: None,
+                    target: "/",
+                    inspector: None,
+                    compression: WebSocketCompression::None,
+                    middleware_session: Some(session),
+                    middleware_context: None,
+                    deny_uninspected_credentials: false,
+                },
+            )
+            .await
+        });
+
+        // RFC 6455 closing handshake: the client sends Close, the server
+        // echoes Close and then closes the TCP connection first.
+        let client_close = masked_frame(true, OPCODE_CLOSE, &1000u16.to_be_bytes());
+        client_app.write_all(&client_close).await.unwrap();
+        let mut relayed_close = vec![0u8; client_close.len()];
+        upstream_app.read_exact(&mut relayed_close).await.unwrap();
+        assert_eq!(relayed_close, client_close);
+        let server_close = [0x80 | OPCODE_CLOSE, 0x02, 0x03, 0xe8];
+        upstream_app.write_all(&server_close).await.unwrap();
+        drop(upstream_app);
+
+        let mut echoed_close = [0u8; 4];
+        client_app.read_exact(&mut echoed_close).await.unwrap();
+        assert_eq!(echoed_close, server_close);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("relay finishes after the closing handshake")
+            .expect("join relay")
+            .expect("closing handshake ends relay normally");
+        let end = tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
+            .await
+            .expect("middleware observes session end");
+        assert!(
+            matches!(
+                end,
+                Some(ObservedWebSocketRequest::SessionEnd(
+                    openshell_core::proto::MiddlewareSessionEndReason::Normal,
+                ))
+            ),
+            "unexpected session end: {end:?}"
+        );
+        assert!(
+            observed.try_recv().is_err(),
+            "closing handshake must produce exactly one session end"
         );
 
         drop(client_app);
