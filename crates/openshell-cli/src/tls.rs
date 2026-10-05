@@ -112,10 +112,11 @@ pub struct TlsMaterials {
 }
 
 /// Resolve the TLS cert directory for a known gateway name.
+///
+/// Uses the same location bootstrap writes the bundle to, keyed by the
+/// unmodified gateway name.
 fn tls_dir_for_gateway(name: &str) -> Option<PathBuf> {
-    let safe_name = sanitize_name(name);
-    let base = xdg_config_dir().ok()?.join("openshell").join("gateways");
-    Some(base.join(safe_name).join("mtls"))
+    openshell_bootstrap::mtls::cli_mtls_dir(name).ok()
 }
 
 /// Fallback TLS directory resolution from a server URL.
@@ -465,7 +466,28 @@ fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {
 
 #[cfg(test)]
 mod tests {
-    use super::tls_server_name;
+    use super::{TlsOptions, require_tls_materials, tls_server_name};
+
+    #[test]
+    fn named_gateway_reads_mtls_bundle_from_bootstrap_gateway_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::test_utils::with_tmp_xdg(tmp.path(), || {
+            // Gateway names may contain characters outside [A-Za-z0-9._-];
+            // bootstrap stores their bundle under the unmodified name.
+            let name = "dev@lab";
+            let mtls = tmp.path().join("openshell/gateways/dev@lab/mtls");
+            std::fs::create_dir_all(&mtls).unwrap();
+            for file in ["ca.crt", "tls.crt", "tls.key"] {
+                std::fs::write(mtls.join(file), file).unwrap();
+            }
+
+            let tls = TlsOptions::default().with_gateway_name(name);
+            let resolved = tls.with_default_paths("https://127.0.0.1:8443");
+            assert_eq!(resolved.ca, Some(mtls.join("ca.crt")));
+            require_tls_materials("https://127.0.0.1:8443", &tls)
+                .expect("mTLS bundle stored by bootstrap should be readable");
+        });
+    }
 
     #[test]
     fn tls_server_name_normalizes_bracketed_ipv6_endpoint() {

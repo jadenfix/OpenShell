@@ -77,7 +77,10 @@ pub fn store_pki_bundle(name: &str, bundle: &PkiBundle) -> Result<()> {
     Ok(())
 }
 
-fn cli_mtls_dir(name: &str) -> Result<PathBuf> {
+/// Directory holding the CLI's mTLS client bundle for gateway `name`.
+///
+/// Location: `$XDG_CONFIG_HOME/openshell/gateways/<name>/mtls/`
+pub fn cli_mtls_dir(name: &str) -> Result<PathBuf> {
     Ok(user_gateway_dir(name)?.join("mtls"))
 }
 
