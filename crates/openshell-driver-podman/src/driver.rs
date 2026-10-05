@@ -1622,9 +1622,9 @@ impl PodmanComputeDriver {
                 warn!(%sandbox_id, volume = %channel_volume, %error, "Failed to remove private channel volume");
                 false
             }
-            // The workload still owns the volume until its removal below.
+            // The workload may still hold the volume until its removal below.
             Err(error) => {
-                debug!(%error, "Channel volume is still attached to workload");
+                debug!(%error, "Channel volume removal deferred until workload removal");
                 true
             }
         };
@@ -1666,7 +1666,7 @@ impl PodmanComputeDriver {
             Err(e) => return Err(ComputeDriverError::from(e)),
         };
 
-        // Remove workspace volume.
+        // Remove the channel and workspace volumes.
         if channel_pending
             && let Err(error) = self
                 .client
@@ -3323,50 +3323,168 @@ mod tests {
         let _ = fs::remove_file(socket_path);
     }
 
-    #[tokio::test]
-    async fn delete_sandbox_preserves_volumes_without_matching_ownership_labels() {
-        let sandbox_id = "sandbox-123";
-        let volume_name = container::volume_name(sandbox_id);
-        let channel_name = crate::isolation::channel_volume_name(sandbox_id);
-        let (socket_path, request_log, handle) = spawn_podman_stub(
-            "delete-unowned-volumes",
-            vec![
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
-                // channel name is occupied by an unlabeled volume
-                StubResponse::new(
-                    StatusCode::OK,
-                    serde_json::json!({
-                        "Name": channel_name, "Driver": "local", "Options": {}, "Labels": {}
-                    })
-                    .to_string(),
-                ),
-                // list_containers returns empty (container already gone)
-                StubResponse::new(StatusCode::OK, "[]"),
-                // workspace name is occupied by another sandbox's volume
-                owned_volume_response(&volume_name, "other-sandbox"),
-            ],
-        );
-        let driver = test_driver(socket_path.clone());
+    fn secret_cleanup_requests(sandbox_id: &str) -> Vec<String> {
+        [
+            container::token_secret_name(sandbox_id),
+            container::resolver_secret_name(sandbox_id),
+            container::proxy_auth_secret_name(sandbox_id),
+        ]
+        .into_iter()
+        .chain(container::tls_secret_names(sandbox_id))
+        .map(|name| format!("DELETE {}", api_path(&format!("/libpod/secrets/{name}"))))
+        .collect()
+    }
 
-        let deleted = driver
+    fn volume_response(name: &str, labels: serde_json::Value) -> StubResponse {
+        StubResponse::new(
+            StatusCode::OK,
+            serde_json::json!({"Name": name, "Driver": "local", "Options": {}, "Labels": labels})
+                .to_string(),
+        )
+    }
+
+    fn volume_inspect_request(name: &str) -> String {
+        format!("GET {}", api_path(&format!("/libpod/volumes/{name}/json")))
+    }
+
+    fn volume_delete_request(name: &str) -> String {
+        format!("DELETE {}", api_path(&format!("/libpod/volumes/{name}")))
+    }
+
+    async fn run_delete(
+        test_name: &str,
+        sandbox_id: &str,
+        responses: Vec<StubResponse>,
+    ) -> (bool, Vec<String>) {
+        let (socket_path, request_log, handle) = spawn_podman_stub(test_name, responses);
+        let deleted = test_driver(socket_path.clone())
             .delete_sandbox(sandbox_id)
             .await
             .expect("delete should succeed");
-
-        assert!(!deleted, "missing container should report deleted=false");
-        handle.await.expect("stub task should finish");
+        let finished = tokio::time::timeout(Duration::from_secs(5), handle).await;
         let requests = request_log
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
-        for name in [&channel_name, &volume_name] {
-            let delete = format!("DELETE {}", api_path(&format!("/libpod/volumes/{name}")));
-            assert!(
-                !requests.contains(&delete),
-                "unowned volume {name} must be preserved: {requests:?}"
-            );
-        }
         let _ = fs::remove_file(socket_path);
+        finished
+            .unwrap_or_else(|_| panic!("stub did not receive every expected request: {requests:?}"))
+            .expect("stub task should finish");
+        (deleted, requests)
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_preserves_unowned_volumes_without_container() {
+        let sandbox_id = "sandbox-123";
+        let volume_name = container::volume_name(sandbox_id);
+        let channel_name = crate::isolation::channel_volume_name(sandbox_id);
+        let secrets = secret_cleanup_requests(sandbox_id);
+        let responses = [
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
+            // channel name is occupied by an unlabeled volume
+            volume_response(&channel_name, serde_json::json!({})),
+            StubResponse::new(StatusCode::OK, "[]"), // container already gone
+            // workspace name is occupied by another sandbox's volume
+            owned_volume_response(&volume_name, "other-sandbox"),
+        ]
+        .into_iter()
+        .chain(
+            secrets
+                .iter()
+                .map(|_| StubResponse::new(StatusCode::NO_CONTENT, "")),
+        )
+        .collect();
+
+        let (deleted, requests) =
+            run_delete("delete-unowned-no-container", sandbox_id, responses).await;
+
+        assert!(!deleted, "missing container should report deleted=false");
+        assert_eq!(requests.len(), 4 + secrets.len(), "{requests:?}");
+        assert_eq!(requests[1], volume_inspect_request(&channel_name));
+        assert!(requests[2].contains("/libpod/containers/json"));
+        assert_eq!(requests[3], volume_inspect_request(&volume_name));
+        assert_eq!(requests[4..], secrets[..], "no volume DELETE may be issued");
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_preserves_unowned_volumes_with_container() {
+        let sandbox_id = "sandbox-123";
+        let container_id = "abc123def456";
+        let volume_name = container::volume_name(sandbox_id);
+        let channel_name = crate::isolation::channel_volume_name(sandbox_id);
+        let secrets = secret_cleanup_requests(sandbox_id);
+        let list_body = serde_json::json!([{
+            "Id": container_id,
+            "Names": ["openshell-default--demo-sandbox-123"],
+            "State": "running",
+            "Labels": {LABEL_SANDBOX_ID: sandbox_id}
+        }])
+        .to_string();
+        let responses = [
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
+            // channel name is occupied by another sandbox's volume
+            owned_volume_response(&channel_name, "other-sandbox"),
+            StubResponse::new(StatusCode::OK, list_body),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove workload
+            // workspace name is occupied by a volume without a workspace label
+            volume_response(
+                &volume_name,
+                serde_json::json!({LABEL_SANDBOX_ID: sandbox_id}),
+            ),
+        ]
+        .into_iter()
+        .chain(
+            secrets
+                .iter()
+                .map(|_| StubResponse::new(StatusCode::NO_CONTENT, "")),
+        )
+        .collect();
+
+        let (deleted, requests) =
+            run_delete("delete-unowned-with-container", sandbox_id, responses).await;
+
+        assert!(deleted, "existing container should report deleted=true");
+        assert_eq!(requests.len(), 5 + secrets.len(), "{requests:?}");
+        assert_eq!(requests[1], volume_inspect_request(&channel_name));
+        assert!(requests[2].contains("/libpod/containers/json"));
+        assert!(requests[3].contains(&format!("/libpod/containers/{container_id}")));
+        assert_eq!(requests[4], volume_inspect_request(&volume_name));
+        assert_eq!(requests[5..], secrets[..], "no volume DELETE may be issued");
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_removes_owned_volume_regardless_of_ownership_options() {
+        let sandbox_id = "sandbox-123";
+        let volume_name = container::volume_name(sandbox_id);
+        let secrets = secret_cleanup_requests(sandbox_id);
+        let options = serde_json::json!({"o": "uid=1234,gid=1235", "UID": "1234", "GID": "1235"});
+        let responses = [
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
+            volume_not_found_response(),                   // inspect channel
+            StubResponse::new(StatusCode::OK, "[]"),       // container already gone
+            StubResponse::new(
+                StatusCode::OK,
+                serde_json::json!({
+                    "Name": volume_name, "Driver": "local", "Options": options,
+                    "Labels": {LABEL_SANDBOX_ID: sandbox_id, container::LABEL_SANDBOX_WORKSPACE: ""}
+                })
+                .to_string(),
+            ),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // remove workspace volume
+        ]
+        .into_iter()
+        .chain(
+            secrets
+                .iter()
+                .map(|_| StubResponse::new(StatusCode::NO_CONTENT, "")),
+        )
+        .collect();
+
+        let (_, requests) = run_delete("delete-owned-with-options", sandbox_id, responses).await;
+
+        assert_eq!(requests[3], volume_inspect_request(&volume_name));
+        assert_eq!(requests[4], volume_delete_request(&volume_name));
+        assert_eq!(requests[5..], secrets[..]);
     }
 
     /// Write a valid `user:pass` credential to a unique path for proxy-auth

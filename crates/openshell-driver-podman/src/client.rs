@@ -769,28 +769,36 @@ impl PodmanClient {
     ///
     /// A generated name is not proof of ownership: a volume that occupies
     /// the name without this sandbox's ownership labels is preserved and
-    /// reported as [`PodmanApiError::InvalidInput`]. Idempotent (not-found
-    /// is ignored).
+    /// reported as [`PodmanApiError::InvalidInput`]. Driver options such as
+    /// filesystem UID/GID are not part of the ownership evidence, so legacy
+    /// and re-owned volumes remain cleanable. Idempotent (not-found is
+    /// ignored).
     pub(crate) async fn remove_owned_volume(
         &self,
         name: &str,
         sandbox_id: &str,
     ) -> Result<(), PodmanApiError> {
+        use openshell_core::driver_utils::{LABEL_SANDBOX_ID, LABEL_SANDBOX_WORKSPACE};
+
         let volume = match self.inspect_volume(name).await {
             Ok(volume) => volume,
             Err(PodmanApiError::NotFound(_)) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let owned = volume.labels.as_ref().is_some_and(|labels| {
-            labels
-                .get(openshell_core::driver_utils::LABEL_SANDBOX_ID)
-                .map(String::as_str)
-                == Some(sandbox_id)
-                && labels.contains_key(openshell_core::driver_utils::LABEL_SANDBOX_WORKSPACE)
-        });
-        if !owned || volume.driver != "local" || !volume.options.is_empty() {
+        let labels = volume.labels.unwrap_or_default();
+        let mismatch = match labels.get(LABEL_SANDBOX_ID) {
+            None => Some(format!("it has no {LABEL_SANDBOX_ID} label")),
+            Some(owner) if owner != sandbox_id => Some(format!(
+                "its {LABEL_SANDBOX_ID} label names sandbox '{owner}'"
+            )),
+            Some(_) if !labels.contains_key(LABEL_SANDBOX_WORKSPACE) => {
+                Some(format!("it has no {LABEL_SANDBOX_WORKSPACE} label"))
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = mismatch {
             return Err(PodmanApiError::InvalidInput(format!(
-                "volume '{name}' is not owned by sandbox '{sandbox_id}'; preserving it"
+                "preserving volume '{name}' because {reason}; it is not owned by sandbox '{sandbox_id}'"
             )));
         }
         self.remove_volume(name).await

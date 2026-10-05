@@ -103,7 +103,10 @@ Stop retains both containers, workspace, channel, and secrets. Start restores
 the consumed sandbox bootstrap from a copy in the supervisor's private
 filesystem, verifies the fence, and starts the same pair. A failed supervisor
 start stops the workload. Delete removes the companion first, then the workload,
-channel, workspace, and driver-owned secrets. User-owned volumes are retained.
+channel, workspace, and driver-owned secrets. The channel and workspace volumes
+are removed only when their `openshell.ai/sandbox-id` label names the sandbox and
+they carry a workspace label; a volume that occupies a generated name without
+that evidence is retained with a warning. User-owned volumes are retained.
 
 Only workload containers appear in sandbox list/watch results. Readiness uses
 the supervisor's private health socket; there is no shell, legacy marker, or
