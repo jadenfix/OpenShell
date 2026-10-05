@@ -63,6 +63,23 @@ pub(super) async fn handle_expose_service(
     .await
 }
 
+/// Map a failed endpoint write to a gRPC status.
+///
+/// Losing the `MustCreate` race to a concurrent create of the same endpoint is
+/// the create-path equivalent of a CAS conflict, so both report `ABORTED` and
+/// the caller can retry against the now-existing endpoint.
+fn expose_service_write_error(err: crate::persistence::PersistenceError) -> Status {
+    match err {
+        crate::persistence::PersistenceError::UniqueViolation { .. } => {
+            openshell_core::rpc_error::resource_version_conflict(
+                "expose service failed due to concurrent creation",
+                None,
+            )
+        }
+        other => super::persistence_error_to_status(other, "expose service"),
+    }
+}
+
 pub(super) fn validate_service_exposure_request(
     service: &str,
     target_port: u32,
@@ -168,7 +185,7 @@ pub(super) async fn expose_service_endpoint(
             condition,
         )
         .await
-        .map_err(|e| super::persistence_error_to_status(e, "expose service"))?;
+        .map_err(expose_service_write_error)?;
 
     let mut endpoint = endpoint;
     if let Some(ref mut meta) = endpoint.metadata {
@@ -458,6 +475,21 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
+    }
+
+    #[test]
+    fn expose_service_lost_create_race_is_aborted() {
+        let status =
+            expose_service_write_error(crate::persistence::PersistenceError::unique_violation(
+                Some("objects_name_uq".to_string()),
+                Some("Key (object_type, workspace, name) already exists.".to_string()),
+            ));
+        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert!(
+            !status.message().contains("objects_name_uq"),
+            "storage constraint names must not leak to clients: {}",
+            status.message()
+        );
     }
 
     #[test]
