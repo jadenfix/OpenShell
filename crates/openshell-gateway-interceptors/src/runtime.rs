@@ -426,7 +426,11 @@ fn validate_result_contract(plan: &BindingPlan, result: &InterceptorResult) -> R
 }
 
 fn status_from_result(result: &InterceptorResult, reason: String) -> Status {
-    let code = grpc_code_from_name(&result.status_code).unwrap_or(Code::PermissionDenied);
+    // A denial must never surface as OK: callers would read the empty
+    // response as success. Treat OK like any other unusable code.
+    let code = grpc_code_from_name(&result.status_code)
+        .filter(|code| *code != Code::Ok)
+        .unwrap_or(Code::PermissionDenied);
     Status::new(code, reason)
 }
 
@@ -779,6 +783,38 @@ mod tests {
             .decode_message_to_json("openshell.v1.CreateProviderRequest", &request)
             .unwrap();
         ValidatedOperation::new(codec, "openshell.v1.CreateProviderRequest", json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn denial_status_code_maps_to_grpc_code_and_never_ok() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let cases = [
+            ("NOT_FOUND", Code::NotFound),
+            ("", Code::PermissionDenied),
+            ("NOT_A_CODE", Code::PermissionDenied),
+            ("OK", Code::PermissionDenied),
+            (" ok ", Code::PermissionDenied),
+        ];
+
+        for (status_code, expected) in cases {
+            let result = InterceptorResult {
+                allowed: false,
+                reason: "blocked".to_string(),
+                status_code: status_code.to_string(),
+                ..InterceptorResult::default()
+            };
+            let status = apply_evaluation_result(
+                &codec,
+                "openshell.v1.CreateProviderRequest",
+                &test_modify_plan(FailurePolicy::FailClosed),
+                &result,
+                create_provider_operation(&codec),
+            )
+            .expect_err("a denial must reject the operation");
+
+            assert_eq!(status.code(), expected, "status_code {status_code:?}");
+            assert_eq!(status.message(), "blocked");
+        }
     }
 
     #[tokio::test]
