@@ -1624,12 +1624,13 @@ fn validate_sandbox_policy_with_mcp_presence(
                     ep.persisted_queries
                 ));
             }
-            if ep.protocol == "sql" && enforcement == "enforce" {
+            let l7_protocol = L7Protocol::parse(&ep.protocol);
+            if l7_protocol == Some(L7Protocol::Sql) && enforcement == "enforce" {
                 l7_errors.push(
                     "SQL enforcement requires full SQL parsing; use enforcement: audit".to_string(),
                 );
             }
-            if ep.protocol == "graphql" {
+            if l7_protocol == Some(L7Protocol::Graphql) {
                 for (rule_index, rule) in ep.rules.iter().enumerate() {
                     let operation_type = rule
                         .allow
@@ -2233,6 +2234,46 @@ network_policies:
             violations[0]
                 .to_string()
                 .contains("unknown enforcement enum value 99")
+        );
+    }
+
+    #[test]
+    fn protocol_specific_validation_ignores_protocol_case() {
+        let policy = parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: GraphQL
+        rules:
+          - allow:
+              fields: [viewer]
+      - host: db.example.com
+        port: 443
+        protocol: SQL
+        enforcement: enforce
+        access: full
+",
+        )
+        .expect("should parse");
+
+        let violations = validate_sandbox_policy(&policy)
+            .expect_err("mixed-case protocols must get protocol-specific validation");
+        let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("rules[0].allow.operation_type must be")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("SQL enforcement requires full SQL parsing")),
+            "{messages:?}"
         );
     }
 

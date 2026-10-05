@@ -1095,12 +1095,13 @@ impl AccessPreset {
     /// Expand a preset to the authored protocol methods it represents.
     #[must_use]
     pub fn methods(self, protocol: &str) -> &'static [&'static str] {
-        match (protocol, self) {
+        let websocket = protocol.eq_ignore_ascii_case("websocket");
+        match (websocket, self) {
             (_, Self::Full) => &["*"],
-            ("websocket", Self::ReadOnly) => &["GET"],
-            ("websocket", Self::ReadWrite) => &["GET", "WEBSOCKET_TEXT"],
-            (_, Self::ReadOnly) => &["GET", "HEAD", "OPTIONS"],
-            (_, Self::ReadWrite) => &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"],
+            (true, Self::ReadOnly) => &["GET"],
+            (true, Self::ReadWrite) => &["GET", "WEBSOCKET_TEXT"],
+            (false, Self::ReadOnly) => &["GET", "HEAD", "OPTIONS"],
+            (false, Self::ReadWrite) => &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"],
         }
     }
 }
@@ -1461,6 +1462,10 @@ network_policies:
         assert_eq!(
             expand_access_preset("websocket", "read-write"),
             Some(&["GET", "WEBSOCKET_TEXT"][..])
+        );
+        assert_eq!(
+            expand_access_preset("WebSocket", "read-only"),
+            Some(&["GET"][..])
         );
         assert_eq!(expand_access_preset("rest", "unknown"), None);
     }

@@ -9,9 +9,9 @@ use openshell_core::proto::{
 };
 
 use crate::{
-    PolicyViolation, canonicalize_mcp_options, is_provider_rule_name, network_access_preset_to_str,
-    network_enforcement_mode_to_str, network_tls_mode_to_str, restrictive_default_policy,
-    validate_and_canonicalize_sandbox_policy,
+    L7Protocol, PolicyViolation, canonicalize_mcp_options, is_provider_rule_name,
+    network_access_preset_to_str, network_enforcement_mode_to_str, network_tls_mode_to_str,
+    restrictive_default_policy, validate_and_canonicalize_sandbox_policy,
 };
 
 const DEFAULT_JSON_RPC_MAX_BODY_BYTES: u32 = 64 * 1024;
@@ -2207,7 +2207,10 @@ fn ensure_method_path_endpoint(
             port,
         });
     }
-    if !matches!(endpoint.protocol.as_str(), "rest" | "websocket") {
+    if !matches!(
+        L7Protocol::parse(&endpoint.protocol),
+        Some(L7Protocol::Rest | L7Protocol::Websocket)
+    ) {
         return Err(PolicyMergeError::UnsupportedEndpointProtocol {
             host: host.to_string(),
             port,
@@ -4347,6 +4350,67 @@ mod tests {
             warning,
             PolicyMergeWarning::ExpandedAccessPreset { access, .. } if access == "read-write"
         )));
+    }
+
+    #[test]
+    fn add_allow_matches_endpoint_protocol_case_insensitively() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "github".to_string(),
+            NetworkPolicyRule {
+                name: "github".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "REST".to_string(),
+                    rules: vec![rest_rule("GET", "/repos/**")],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy.network_policies.insert(
+            "realtime".to_string(),
+            NetworkPolicyRule {
+                name: "realtime".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "realtime.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "WebSocket".to_string(),
+                    access: NetworkAccessPreset::ReadOnly as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[
+                PolicyMergeOp::AddAllowRules {
+                    target: l7_target("github", "api.github.com", &[443], &[]),
+                    rules: vec![rest_rule("POST", "/repos/*/issues")],
+                },
+                PolicyMergeOp::AddAllowRules {
+                    target: l7_target("realtime", "realtime.example.com", &[443], &[]),
+                    rules: vec![rest_rule("WEBSOCKET_TEXT", "/rooms/**")],
+                },
+            ],
+        )
+        .expect("protocol names are case-insensitive");
+
+        let github = &result.policy.network_policies["github"].endpoints[0];
+        assert!(github.rules.contains(&rest_rule("POST", "/repos/*/issues")));
+        let realtime = &result.policy.network_policies["realtime"].endpoints[0];
+        assert_eq!(
+            realtime.rules,
+            vec![
+                rest_rule("GET", "**"),
+                rest_rule("WEBSOCKET_TEXT", "/rooms/**"),
+            ]
+        );
     }
 
     #[test]
