@@ -6291,8 +6291,9 @@ fn sandbox_template_to_k8s_with_validated_config(
     // a projected SA token claim (pod name + uid) back to a sandbox identity
     // when the supervisor calls `IssueSandboxToken` at startup. The gateway
     // also verifies the pod's controlling Sandbox ownerReference against the
-    // live CR before accepting this annotation. Its K8s Role does NOT grant
-    // `patch pods`, so this annotation is effectively immutable post-create.
+    // live CR before accepting this annotation. The driver's only pod patch
+    // removes the bootstrap scheduling gates; it never rewrites this
+    // annotation after create.
     let mut pod_annotations = platform_config_struct(template, "annotations")
         .and_then(|v| match v {
             serde_json::Value::Object(map) => Some(map),
