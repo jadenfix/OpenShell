@@ -536,6 +536,15 @@ fn evaluate_status(
                 ProviderReadinessState::Pending,
                 ProviderReadinessReason::SupervisorDisconnected,
             );
+        } else if !session.supported {
+            // Unsupported supervisors never report, so their evidence is never
+            // refreshed. Check support before the TTL so a connected but
+            // unsupported supervisor stays terminally unsupported.
+            set(
+                &mut status,
+                ProviderReadinessState::Failed,
+                ProviderReadinessReason::UnsupportedSupervisor,
+            );
         } else if session.last_seen.elapsed()
             >= Duration::from_secs(u64::from(OBSERVATION_TTL_SECONDS))
         {
@@ -543,12 +552,6 @@ fn evaluate_status(
                 &mut status,
                 ProviderReadinessState::Pending,
                 ProviderReadinessReason::SupervisorLeaseExpired,
-            );
-        } else if !session.supported {
-            set(
-                &mut status,
-                ProviderReadinessState::Failed,
-                ProviderReadinessReason::UnsupportedSupervisor,
             );
         } else if let Some(observation) = session.observation.as_ref() {
             let reason = ProviderReadinessReason::try_from(observation.reason)

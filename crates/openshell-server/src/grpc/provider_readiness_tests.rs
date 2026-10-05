@@ -388,6 +388,17 @@ fn unsupported_and_uninitialized_sessions_cannot_publish_evidence() {
         .reason,
         ProviderReadinessReason::UnsupportedSupervisor as i32
     );
+    // Unsupported supervisors never report, so their evidence ages past the
+    // observation TTL while the session stays connected. They must remain
+    // terminally unsupported instead of looking like a lapsed lease.
+    let mut aged = registry.snapshot(&hello.sandbox_id).unwrap().unwrap();
+    aged.last_seen -= Duration::from_secs(u64::from(OBSERVATION_TTL_SECONDS) + 1);
+    let aged_status = evaluate(&receipt, Some(&aged));
+    assert_eq!(aged_status.state, ProviderReadinessState::Failed as i32);
+    assert_eq!(
+        aged_status.reason,
+        ProviderReadinessReason::UnsupportedSupervisor as i32
+    );
     let other = Uuid::new_v4().to_string();
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let (shutdown, _shutdown_rx) = tokio::sync::oneshot::channel();
