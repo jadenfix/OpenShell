@@ -1322,6 +1322,23 @@ async fn supersede_other_pending_chunks_for_endpoint(
         return;
     }
 
+    // Mechanistic dedup can alias a repeated denial onto an existing row that
+    // a reviewer or an earlier supersede already decided. That row is not a
+    // newer proposal, so only a still-pending chunk may supersede others.
+    match state.store.get_draft_chunk(new_chunk_id).await {
+        Ok(Some(chunk)) if chunk.status == "pending" => {}
+        Ok(_) => return,
+        Err(err) => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                chunk_id = %new_chunk_id,
+                error = %err,
+                "supersede status check failed; older pending chunks (if any) remain pending"
+            );
+            return;
+        }
+    }
+
     let pending = match state
         .store
         .list_draft_chunks(sandbox_id, Some("pending"))
@@ -16298,7 +16315,7 @@ mod tests {
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_api_github_com_443".to_string(),
-                    proposed_rule: Some(mechanistic_rule),
+                    proposed_rule: Some(mechanistic_rule.clone()),
                     rationale: "Allow /usr/bin/curl to connect to api.github.com:443.".to_string(),
                     ..Default::default()
                 }],
@@ -16446,6 +16463,64 @@ mod tests {
             "rejection reason should explain the supersede; got: {}",
             mech_after.rejection_reason
         );
+
+        // Step 3: the same denial recurs. The mechanistic dedup folds it into
+        // the already-rejected chunk, which is not a newer proposal and must
+        // not supersede the agent's pending refinement.
+        let repeat_submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.clone(),
+                analysis_mode: "mechanistic".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_api_github_com_443".to_string(),
+                    proposed_rule: Some(mechanistic_rule),
+                    rationale: "Allow /usr/bin/curl to connect to api.github.com:443.".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            repeat_submit.accepted_chunk_ids,
+            vec![mechanistic_chunk_id.clone()],
+            "repeated mechanistic denial should dedup onto the existing chunk"
+        );
+
+        let draft_repeat = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let agent_repeat = draft_repeat
+            .chunks
+            .iter()
+            .find(|c| c.id == agent_chunk_id)
+            .expect("agent chunk present");
+        assert_eq!(
+            agent_repeat.status, "pending",
+            "a repeated denial deduped onto a rejected mechanistic chunk must not \
+             supersede the agent's pending refinement; got: {} ({})",
+            agent_repeat.status, agent_repeat.rejection_reason
+        );
+        let mech_repeat = draft_repeat
+            .chunks
+            .iter()
+            .find(|c| c.id == mechanistic_chunk_id)
+            .expect("mechanistic chunk present");
+        assert_eq!(mech_repeat.status, "rejected");
     }
 
     /// Auto-approval is **proposer-agnostic**: a mechanistic proposal whose
